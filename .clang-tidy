@@ -1,0 +1,36 @@
+# StreamForge static analysis configuration (clang-tidy-20).
+# Curated, actionable checks. Two checks are explicitly disabled with rationale:
+#   - performance-enum-size: enum classes deliberately use int as the underlying type so
+#     that serialized/logged code values (ErrorCode, Quality, ...) stay stable and readable.
+#   - bugprone-easily-swappable-parameters: the (device_id, metric_id)-style adjacent
+#     same-type parameters are an intentional, domain-driven API shape.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  -performance-enum-size,
+  modernize-use-override,
+  modernize-use-bool-literals,
+  modernize-use-emplace,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-use-nodiscard,
+  modernize-loop-convert,
+  modernize-return-braced-init-list,
+  modernize-use-using,
+  readability-implicit-bool-conversion,
+  readability-inconsistent-declaration-parameter-name,
+  readability-non-const-parameter,
+  readability-redundant-string-cstr,
+  readability-redundant-string-init,
+  readability-static-accessed-through-instance,
+  readability-string-compare,
+  readability-uniqueptr-delete-release
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/streamforge/.*'
+CheckOptions:
+  - key: readability-implicit-bool-conversion.AllowPointerConditions
+    value: 'true'
+  - key: readability-implicit-bool-conversion.AllowIntegerConditions
+    value: 'true'
