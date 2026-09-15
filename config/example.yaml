@@ -1,0 +1,104 @@
+# StreamForge example configuration (schema 1).
+# Relative paths resolve against the directory containing this file.
+
+schema_version: 1
+
+server:
+  bind: "127.0.0.1"
+  port: 8080            # HTTP API lands in M3; validated now
+
+directories:
+  input: "data/input"
+  archive: "data/archive"
+  quarantine: "data/quarantine"
+  reports: "data/reports"
+
+database:
+  path: "data/streamforge.db"
+
+pipeline:
+  workers: 4
+  queue_capacity: 100000
+  batch_size: 1000
+  allowed_lateness: "5m"      # watermark = max_event_time - allowed_lateness (M2)
+  scan_interval: "2s"
+  quiet_period: "5s"
+  max_error_rate: 0.10
+  error_rate_min_records: 100
+  shutdown_timeout: "25s"
+  history_range: "7d"
+  ambiguous_time_policy: "earlier"
+
+windows: [60, 300, 3600]      # seconds; fixed-window aggregation lands in M2
+
+log:
+  level: "info"
+  format: "text"
+  file: "logs/streamforge.log"
+  max_size_mb: 50
+  max_files: 5
+
+metrics:
+  - id: bearing_temp
+    canonical_unit: "C"
+    input_units: ["C", "F", "K"]
+    expected_period: "10s"
+    jitter: "2s"
+    max_gap: "60s"
+    interpolation: "linear"
+  - id: outlet_pressure
+    canonical_unit: "kPa"
+    input_units: ["Pa", "kPa", "MPa", "bar"]
+    expected_period: "15s"
+    jitter: "3s"
+    max_gap: "90s"
+    interpolation: "previous"
+  - id: flow_rate
+    canonical_unit: "m3/h"
+    input_units: ["L/min", "m3/h", "m3/s"]
+  - id: vibration
+    canonical_unit: "mm/s"
+    input_units: ["mm/s", "cm/s", "m/s"]
+    expected_period: "5s"
+    jitter: "1s"
+    max_gap: "30s"
+    interpolation: "none"
+  - id: input_power
+    canonical_unit: "kW"
+    input_units: ["W", "kW", "MW"]
+
+devices:
+  - id: pump-07
+    timezone: "Asia/Shanghai"
+    metrics: [bearing_temp, outlet_pressure, flow_rate, vibration, input_power]
+    tags:
+      line: "A"
+      zone: "east"
+  - id: pump-09
+    timezone: "Asia/Shanghai"
+    metrics: [bearing_temp, outlet_pressure, flow_rate, vibration, input_power]
+    tags:
+      line: "A"
+      zone: "west"
+  - id: compressor-02
+    timezone: "UTC"
+    metrics: [vibration, input_power]
+    tags:
+      line: "B"
+
+calibrations:
+  - device: pump-07
+    metric: bearing_temp
+    reject_unmatched: false
+    segments:
+      - {min: -50.0, max: 0.0, slope: 1.0, intercept: 0.0}
+      - {min: 0.0, max: 200.0, slope: 0.98, intercept: 0.5}
+
+derived_metrics: []   # expression engine lands in M3
+rules: []             # rule engine lands in M3
+
+retention:
+  samples_days: 90
+  aggregates_days: 365
+  incidents_days: 730
+  audit_days: 365
