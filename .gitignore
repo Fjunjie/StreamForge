@@ -1,0 +1,22 @@
+# Build and dependency caches
+build/
+build-*/
+.deps/
+
+# Runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+*.log
+data/
+logs/
+
+# Coverage / sanitizer outputs
+*.profraw
+coverage/
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
