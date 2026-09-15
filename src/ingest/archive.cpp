@@ -1,6 +1,10 @@
 #include "streamforge/ingest/archive.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -8,13 +12,17 @@
 #include "streamforge/core/time.hpp"
 #include "streamforge/ingest/file_identity.hpp"
 
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+
 namespace streamforge {
 namespace fs = std::filesystem;
 
 namespace {
 
 // Copies `src` to `dst` (must not exist) and verifies the copy by size and SHA-256 of the
-// first 64 KiB; used when rename() cannot cross filesystems (requirement FR-IN-004).
+// first 64 KiB; used when a move cannot cross filesystems (requirement FR-IN-004).
 Result<void> copy_and_verify(const fs::path& src, const fs::path& dst) {
     std::error_code ec;
     fs::copy_file(src, dst, fs::copy_options::none, ec);
@@ -32,6 +40,69 @@ Result<void> copy_and_verify(const fs::path& src, const fs::path& dst) {
         return Result<void>::Err(Error::make(ErrorCode::IoWrite, "copy verification failed; destination removed"));
     }
     return Result<void>::Ok();
+}
+
+struct MoveOutcome {
+    bool moved = false;        // source successfully moved to dest
+    bool dest_exists = false;  // dest already existed; nothing was changed
+    bool cross_device = false; // atomic move impossible across filesystems
+    bool failed = false;
+    Error error;
+
+    static MoveOutcome ok_moved() { return MoveOutcome{true, false, false, false, {}}; }
+    static MoveOutcome exists() { return MoveOutcome{false, true, false, false, {}}; }
+    static MoveOutcome exdev() { return MoveOutcome{false, false, true, false, {}}; }
+    static MoveOutcome failure(Error e) { return MoveOutcome{false, false, false, true, std::move(e)}; }
+};
+
+// Atomically moves src to dest WITHOUT replacing an existing destination (FR-IN-004 /
+// CWE-367): plain rename() would silently overwrite, so renameat2(RENAME_NOREPLACE) is
+// used, with an atomic link()+unlink() fallback where the flag is unsupported.
+MoveOutcome atomic_move_no_replace(const fs::path& src, const fs::path& dest) {
+    if (::renameat2(AT_FDCWD, src.c_str(), AT_FDCWD, dest.c_str(), RENAME_NOREPLACE) == 0) {
+        return MoveOutcome::ok_moved();
+    }
+    switch (errno) {
+    case EEXIST:
+    case ENOTEMPTY:
+        return MoveOutcome::exists();
+    case EXDEV:
+        return MoveOutcome::exdev();
+    case ENOSYS:
+    case EINVAL:
+    case EOPNOTSUPP:
+        break; // flag unsupported: fall through to the link() based path
+    default:
+        return MoveOutcome::failure(
+            Error::make(ErrorCode::IoRename, std::string("renameat2 failed: ") + std::strerror(errno))
+                .ctx("src", src.string())
+                .ctx("dest", dest.string()));
+    }
+
+    // link() is atomic and never replaces an existing destination.
+    if (::link(src.c_str(), dest.c_str()) != 0) {
+        switch (errno) {
+        case EEXIST:
+            return MoveOutcome::exists();
+        case EXDEV:
+            return MoveOutcome::exdev();
+        default:
+            return MoveOutcome::failure(
+                Error::make(ErrorCode::IoRename, std::string("link failed: ") + std::strerror(errno))
+                    .ctx("src", src.string())
+                    .ctx("dest", dest.string()));
+        }
+    }
+    std::error_code ec;
+    fs::remove(src, ec);
+    if (ec) {
+        // The content is safe at dest, but the source could not be removed; surface the
+        // error so the caller keeps both states visible instead of losing the file.
+        return MoveOutcome::failure(Error::make(ErrorCode::IoRemove, "moved but cannot delete source file")
+                                        .ctx("src", src.string())
+                                        .ctx("detail", ec.message()));
+    }
+    return MoveOutcome::ok_moved();
 }
 
 Result<std::string> move_into(const std::string& path, const std::string& root, const std::string& identity_hash,
@@ -61,56 +132,67 @@ Result<std::string> move_into(const std::string& path, const std::string& root, 
 
     fs::path src(path);
     fs::path dest = dest_dir / src.filename();
-    if (fs::exists(fs::symlink_status(dest, ec))) {
-        // Name collision: append a short identity hash before the extension.
+    for (int attempt = 0;; ++attempt) {
+        auto moved = atomic_move_no_replace(src, dest);
+        if (moved.failed) {
+            return Result<std::string>::Err(std::move(moved.error));
+        }
+        if (moved.moved) {
+            break;
+        }
+        if (moved.cross_device) {
+            // Cross-filesystem: copy + verify + delete; copy_file with copy_options::none
+            // refuses to overwrite, preserving the no-clobber contract.
+            auto copied = copy_and_verify(src, dest);
+            if (!copied.ok()) {
+                return Result<std::string>::Err(copied.error());
+            }
+            fs::remove(src, ec);
+            if (ec) {
+                return Result<std::string>::Err(Error::make(ErrorCode::IoRemove, "copied but cannot delete source file")
+                                                    .ctx("src", path)
+                                                    .ctx("detail", ec.message()));
+            }
+            break;
+        }
+        // Destination exists: append a short identity hash before the extension and retry
+        // exactly once; a second collision is reported instead of overwritten.
+        if (attempt >= 1) {
+            return Result<std::string>::Err(
+                Error::make(ErrorCode::PathCollision, "destination already exists; not overwriting")
+                    .ctx("dest", dest.string()));
+        }
         std::string stem = dest.stem().string();
         std::string ext = dest.extension().string();
-        dest = dest_dir / (stem + "-" + identity_hash.substr(0, 8) + ext);
-    }
-    if (fs::exists(fs::symlink_status(dest, ec))) {
-        return Result<std::string>::Err(
-            Error::make(ErrorCode::PathCollision, "destination already exists; not overwriting")
-                .ctx("dest", dest.string()));
-    }
-
-    errno = 0;
-    fs::rename(src, dest, ec);
-    if (ec) {
-        bool cross_device = ec == std::errc::cross_device_link;
-        if (!cross_device) {
-            return Result<std::string>::Err(Error::make(ErrorCode::IoRename, "rename failed")
-                                                .ctx("src", path)
-                                                .ctx("dest", dest.string())
-                                                .ctx("detail", ec.message()));
-        }
-        auto copied = copy_and_verify(src, dest);
-        if (!copied.ok())
-            return Result<std::string>::Err(copied.error());
-        fs::remove(src, ec);
-        if (ec) {
-            return Result<std::string>::Err(Error::make(ErrorCode::IoRemove, "copied but cannot delete source file")
-                                                .ctx("src", path)
-                                                .ctx("detail", ec.message()));
-        }
+        std::string collided = stem;
+        collided += "-";
+        collided += identity_hash.substr(0, 8);
+        collided += ext;
+        dest = dest_dir / collided;
     }
 
     if (quarantine) {
         fs::path err_file = dest_dir / (dest.filename().string() + ".error.json");
-        std::error_code wec;
         fs::path tmp = err_file;
         tmp += ".tmp";
-        {
-            std::FILE* f = std::fopen(tmp.c_str(), "wb");
-            if (f == nullptr) {
-                return Result<std::string>::Err(
-                    Error::make(ErrorCode::IoWrite, "cannot write error report").ctx("dest", err_file.string()));
-            }
-            std::fwrite(error_json.data(), 1, error_json.size(), f);
-            std::fflush(f);
-            std::fclose(f);
+        bool write_ok = false;
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f != nullptr) {
+            // Every step is checked (CWE-252): a silently truncated report would leave the
+            // quarantined file without its required diagnostics.
+            write_ok = std::fwrite(error_json.data(), 1, error_json.size(), f) == error_json.size() &&
+                       std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+            if (std::fclose(f) != 0)
+                write_ok = false;
         }
-        fs::rename(tmp, err_file, wec);
-        if (wec) {
+        if (!write_ok) {
+            fs::remove(tmp, ec);
+            return Result<std::string>::Err(
+                Error::make(ErrorCode::IoWrite, "cannot write error report").ctx("dest", err_file.string()));
+        }
+        fs::rename(tmp, err_file, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
             return Result<std::string>::Err(
                 Error::make(ErrorCode::IoWrite, "cannot finalize error report").ctx("dest", err_file.string()));
         }

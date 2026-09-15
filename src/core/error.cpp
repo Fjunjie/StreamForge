@@ -38,6 +38,7 @@ constexpr std::array<CodeName, 60> kCodeNames{{
     {ErrorCode::FormatUnsupported, "FormatUnsupported"},
     {ErrorCode::FormatTagSyntax, "FormatTagSyntax"},
     {ErrorCode::FormatUnterminatedQuote, "FormatUnterminatedQuote"},
+    {ErrorCode::FormatBadTime, "FormatBadTime"},
     {ErrorCode::ValidationDeviceUnknown, "ValidationDeviceUnknown"},
     {ErrorCode::ValidationMetricUnknown, "ValidationMetricUnknown"},
     {ErrorCode::ValidationTimeInvalid, "ValidationTimeInvalid"},

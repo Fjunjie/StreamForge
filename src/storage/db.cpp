@@ -238,10 +238,13 @@ Result<void> Txn::commit() {
         return Result<void>::Err(Error::make(ErrorCode::DbExec, "transaction already finished"));
     }
     int rc = sqlite3_exec(db_->handle(), "COMMIT", nullptr, nullptr, nullptr);
-    done_ = true;
     if (rc != SQLITE_OK) {
+        // COMMIT failed (e.g. SQLITE_BUSY): the transaction is still open. Leave done_ false
+        // so the destructor rolls back instead of leaving the connection stuck inside an
+        // open transaction, which would break every subsequent write.
         return Result<void>::Err(Error::make(ErrorCode::DbExec, "COMMIT failed: " + db_->last_error()));
     }
+    done_ = true;
     return Result<void>::Ok();
 }
 

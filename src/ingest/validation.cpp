@@ -105,14 +105,10 @@ ValidationOutcome validate_record(const RawRecord& rec, const ConfigSnapshot& cs
     bool ambiguous_earlier = cs.cfg.pipeline.ambiguous_time_policy == AmbiguousTimePolicy::Earlier;
     auto parsed = parse_event_time(rec.event_time_raw, tz, ambiguous_earlier);
     if (!parsed.ok()) {
-        // Unparseable syntax is structural; DST/timezone semantics are business errors.
-        if (parsed.error().code == ErrorCode::ValidationTimeInvalid &&
-            (parsed.error().message.find("format") != std::string::npos ||
-             parsed.error().message.find("offset requires") != std::string::npos)) {
-            out.kind = ValidationKind::FormatError;
-        } else {
-            out.kind = ValidationKind::BusinessError;
-        }
+        // Structural failures come back as FormatBadTime; value-range and DST semantics are
+        // business errors. Classification is by error code, never by message text.
+        out.kind = parsed.error().code == ErrorCode::FormatBadTime ? ValidationKind::FormatError
+                                                                   : ValidationKind::BusinessError;
         out.error = parsed.error();
         out.error.ctx("line", std::to_string(rec.line_no));
         return out;

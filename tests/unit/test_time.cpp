@@ -76,12 +76,22 @@ TEST_CASE("invalid times rejected", "[time]") {
     CHECK_FALSE(parse_event_time("2026-02-30T00:00:00Z", nullptr, true).ok());
     CHECK_FALSE(parse_event_time("", nullptr, true).ok());
     CHECK_FALSE(parse_event_time("2026-08-01T09:15:30.125+99:00", nullptr, true).ok());
+    // 16-digit millisecond values are parseable in int64 but overflow when scaled to
+    // microseconds; they must be rejected, not wrap around (audit: CWE-190).
+    CHECK_FALSE(parse_event_time("9999999999999999", nullptr, true).ok());
+    CHECK_FALSE(parse_event_time("9223372036854776", nullptr, true).ok());
 }
 
 TEST_CASE("admin time parses offset-less values as UTC", "[time]") {
     auto t = parse_admin_time("2026-08-01T00:00:00");
     REQUIRE(t.ok());
     CHECK(format_utc_us(t.value()) == "2026-08-01T00:00:00.000000Z");
+}
+
+TEST_CASE("admin time normalizes offset-less leap seconds", "[time]") {
+    auto t = parse_admin_time("2026-06-30T23:59:60");
+    REQUIRE(t.ok());
+    CHECK(format_utc_us(t.value()) == "2026-07-01T00:00:00.000000Z");
 }
 
 TEST_CASE("format keeps microseconds", "[time]") {

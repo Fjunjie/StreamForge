@@ -210,6 +210,12 @@ TEST_CASE("simulated crash in stage 1 resumes from checkpoint without duplicates
     CHECK(resumed.file_id == crashed.file_id);
     CHECK(store->count_samples("dev-01", "temp", 0, 2000000000000000LL).value() == 10);
 
+    // File counters must include the pre-crash batch (audit: resume must not reset stats).
+    auto final_row_rc = store->find_file_by_id(crashed.file_id);
+    const auto& final_row = sf_test::value_or_fail(final_row_rc);
+    CHECK(final_row.record_count == 10);
+    CHECK(final_row.accepted_count == 10);
+
     // Re-running an identical file at the same path skips (the completed run archived the
     // original away, so recreate it byte-for-byte with the pinned mtime first).
     dir.file("input/crash.csv", kGoodCsvHeader + good_csv_rows(10));

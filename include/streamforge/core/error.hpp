@@ -41,6 +41,7 @@ enum class ErrorCode : int {
     FormatUnsupported = 4007,
     FormatTagSyntax = 4008,
     FormatUnterminatedQuote = 4009,
+    FormatBadTime = 4010,
     // Business validation (counts toward file error rate).
     ValidationDeviceUnknown = 5000,
     ValidationMetricUnknown = 5001,

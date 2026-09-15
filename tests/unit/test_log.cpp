@@ -13,7 +13,7 @@ using namespace streamforge;
 namespace {
 std::string slurp(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 } // namespace
 

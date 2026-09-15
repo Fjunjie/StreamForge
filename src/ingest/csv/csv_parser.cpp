@@ -64,17 +64,24 @@ std::vector<std::string> CsvParser::split_line(const std::string& line) const {
 
 namespace {
 
-// Strips the UTF-8 BOM (first physical line only) and a trailing CR.
-std::string clean_line(const std::string& raw, int64_t line_no, int64_t& bom_bytes) {
-    std::string text = raw;
-    if (line_no == 1 && text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
-        static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
-        text.erase(0, 3);
-        bom_bytes = 3;
+// Strips the UTF-8 BOM (first physical line only) and a trailing CR. bom_bytes counts the
+// BOM bytes so callers can adjust byte accounting; 0 when no BOM was present.
+struct CleanLine {
+    std::string text;
+    int64_t bom_bytes = 0;
+};
+
+CleanLine clean_line(const std::string& raw, int64_t line_no) {
+    CleanLine out;
+    out.text = raw;
+    if (line_no == 1 && out.text.size() >= 3 && static_cast<unsigned char>(out.text[0]) == 0xEF &&
+        static_cast<unsigned char>(out.text[1]) == 0xBB && static_cast<unsigned char>(out.text[2]) == 0xBF) {
+        out.text.erase(0, 3);
+        out.bom_bytes = 3;
     }
-    if (!text.empty() && text.back() == '\r')
-        text.pop_back();
-    return text;
+    if (!out.text.empty() && out.text.back() == '\r')
+        out.text.pop_back();
+    return out;
 }
 
 } // namespace
@@ -92,8 +99,7 @@ CsvParser::Next CsvParser::consume_header() {
             out.kind = Next::Kind::Eof;
             return out;
         }
-        int64_t bom_bytes = 0;
-        std::string text = clean_line(line.text, line_no_, bom_bytes);
+        std::string text = clean_line(line.text, line_no_).text;
 
         if (text.empty())
             continue; // empty line: ignore
@@ -190,8 +196,8 @@ CsvParser::Next CsvParser::next() {
         int64_t record_start_offset = offset_ - line.bytes_consumed;
         int64_t record_start_line = line_no_;
 
-        int64_t bom_bytes = 0;
-        std::string text = clean_line(line.text, line_no_, bom_bytes);
+        CleanLine cleaned = clean_line(line.text, line_no_);
+        const std::string& text = cleaned.text;
         if (text.empty())
             continue; // empty line: ignore
         if (text[0] == '#')
@@ -199,7 +205,7 @@ CsvParser::Next CsvParser::next() {
 
         // Assemble quoted continuation lines.
         std::string record = text;
-        int64_t record_bytes = line.bytes_consumed - bom_bytes;
+        int64_t record_bytes = line.bytes_consumed - cleaned.bom_bytes;
         bool truncated_record = line.truncated;
         while (!line_is_balanced(record)) {
             if (record_bytes > static_cast<int64_t>(options_.max_record_bytes)) {

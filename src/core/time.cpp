@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -124,7 +125,7 @@ bool consumed_all(std::istringstream& in) {
 Result<ParsedTime> parse_event_time(const std::string& raw, const date::time_zone* device_tz, bool ambiguous_earlier) {
     ParsedTime result;
     if (raw.empty()) {
-        return Result<ParsedTime>::Err(Error::make(ErrorCode::ValidationTimeInvalid, "empty time"));
+        return Result<ParsedTime>::Err(Error::make(ErrorCode::FormatBadTime, "empty time"));
     }
 
     // Unix epoch milliseconds.
@@ -136,8 +137,11 @@ Result<ParsedTime> parse_event_time(const std::string& raw, const date::time_zon
         }
         errno = 0;
         char* endp = nullptr;
+        // Guard the *1000 conversion: values beyond INT64_MAX/1000 would overflow (CWE-190)
+        // even though they fit within 16 digits.
+        constexpr long long kMaxUnixMs = std::numeric_limits<long long>::max() / 1000;
         long long ms = std::strtoll(raw.c_str(), &endp, 10);
-        if (errno != 0 || endp != raw.c_str() + raw.size()) {
+        if (errno != 0 || endp != raw.c_str() + raw.size() || ms > kMaxUnixMs || ms < -kMaxUnixMs) {
             return Result<ParsedTime>::Err(
                 Error::make(ErrorCode::ValidationTimeInvalid, "unix milliseconds out of range").ctx("value", raw));
         }
@@ -181,7 +185,7 @@ Result<ParsedTime> parse_event_time(const std::string& raw, const date::time_zon
         if (consumed_all(in)) {
             if (device_tz == nullptr) {
                 return Result<ParsedTime>::Err(
-                    Error::make(ErrorCode::ValidationTimeInvalid, "time without offset requires a device timezone")
+                    Error::make(ErrorCode::FormatBadTime, "time without offset requires a device timezone")
                         .ctx("value", raw));
             }
             auto info = device_tz->get_info(lt);
@@ -204,7 +208,7 @@ Result<ParsedTime> parse_event_time(const std::string& raw, const date::time_zon
     }
 
     return Result<ParsedTime>::Err(
-        Error::make(ErrorCode::ValidationTimeInvalid, "time is not a supported format").ctx("value", raw));
+        Error::make(ErrorCode::FormatBadTime, "time is not a supported format").ctx("value", raw));
 }
 
 std::string format_utc_us(TimePointUs tp) {
@@ -218,12 +222,22 @@ Result<TimePointUs> parse_admin_time(const std::string& raw) {
     if (parsed.ok()) {
         return Result<TimePointUs>::Ok(parsed.value().tp);
     }
-    // Retry: offset-less values are interpreted as UTC for administrative inputs.
+    // Retry: offset-less values are interpreted as UTC for administrative inputs, with the
+    // same leap-second normalization as the offset-bearing path.
+    std::string normalized = raw;
+    bool leap = false;
+    if (std::string rewritten; extract_leap_second(normalized, rewritten)) {
+        leap = true;
+        normalized = rewritten;
+    }
     LocalUs lt{};
-    std::istringstream in(raw);
+    std::istringstream in(normalized);
     in >> date::parse("%FT%T", lt);
     if (consumed_all(in)) {
-        return Result<TimePointUs>::Ok(TimePointUs{lt.time_since_epoch()});
+        TimePointUs tp{lt.time_since_epoch()};
+        if (leap)
+            tp += std::chrono::minutes{1};
+        return Result<TimePointUs>::Ok(tp);
     }
     return Result<TimePointUs>::Err(parsed.error());
 }

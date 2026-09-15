@@ -128,7 +128,11 @@ ImportPipeline::ProcessResult ImportPipeline::start_new_file(const FileIdentity&
 
     // Same path but different content: the previous version must not silently stay active.
     auto latest = store_->latest_file_by_path(identity.path);
-    const auto& latest_row = latest.ok() && latest.value() ? &*latest.value() : nullptr;
+    const storage::SourceFileRow* latest_row = nullptr;
+    if (latest.ok()) {
+        const auto& latest_opt = latest.value();
+        if (latest_opt) latest_row = &*latest_opt;
+    }
     if (latest_row && file_status_recoverable(latest_row->status)) {
         store_->update_file_status(latest_row->id, FileStatus::SourceChanged);
         SPDLOG_LOGGER_WARN(logger("ingest"),
@@ -184,6 +188,12 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
     }
 
     Stage1Context ctx;
+    // Continue from the counters persisted with the last committed batch so the absolute
+    // counter UPDATE in stage_batch does not wipe pre-crash statistics (resume consistency).
+    ctx.counts.record_count = row.record_count;
+    ctx.counts.accepted_count = row.accepted_count;
+    ctx.counts.format_errors = row.format_errors;
+    ctx.counts.business_errors = row.business_errors;
     ctx.cp.stage = 1;
     ctx.cp.stage1_offset = resume ? resume_offset : 0;
     ctx.cp.stage1_line = resume ? resume_line_base : 0;
@@ -211,7 +221,14 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
             // The checkpoint sits past the header: re-consume it from the start, then jump.
             auto header = parser.consume_header();
             if (header.kind == CsvParser::Next::Kind::Fatal) {
-                store_->finalize_quarantine(row.id, error_summary_json(header.error.code_name(), header.error.message));
+                auto finalized = store_->finalize_quarantine(
+                    row.id, error_summary_json(header.error.code_name(), header.error.message));
+                if (!finalized.ok()) {
+                    // DB state is authoritative: do not move the file while the DB update
+                    // failed; the failure propagates and the file stays resumable.
+                    result.error = finalized.error();
+                    return result;
+                }
                 return quarantine_now(row, header.error.code_name(),
                                       "file could not be parsed: " + header.error.message, ctx);
             }
@@ -230,7 +247,12 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
             if (next.kind == CsvParser::Next::Kind::Eof)
                 break;
             if (next.kind == CsvParser::Next::Kind::Fatal) {
-                store_->finalize_quarantine(row.id, error_summary_json(next.error.code_name(), next.error.message));
+                auto finalized =
+                    store_->finalize_quarantine(row.id, error_summary_json(next.error.code_name(), next.error.message));
+                if (!finalized.ok()) {
+                    result.error = finalized.error();
+                    return result;
+                }
                 return quarantine_now(row, next.error.code_name(), "file could not be parsed: " + next.error.message,
                                       ctx);
             }

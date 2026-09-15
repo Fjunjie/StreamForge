@@ -202,24 +202,41 @@ int cmd_import(const Args& args, const streamforge::ConfigSnapshot& cs, Store& s
         std::fprintf(stderr, "path does not exist: %s\n", args.positional1.c_str());
         return kExitBusinessFailure;
     }
-
     std::vector<std::string> paths;
+    bool traversal_failed = false;
     if (fs::is_directory(fs::path(args.positional1))) {
         std::error_code itec;
         if (args.recursive) {
             fs::recursive_directory_iterator it(fs::path(args.positional1),
                                                 fs::directory_options::skip_permission_denied, itec);
+            if (itec) {
+                std::fprintf(stderr, "cannot iterate directory %s: %s\n", args.positional1.c_str(),
+                             itec.message().c_str());
+                store.audit("import", "cli", args.positional1, "failed", "", "{}");
+                return kExitBusinessFailure;
+            }
             fs::recursive_directory_iterator end;
             while (it != end) {
                 std::error_code fec;
                 if (it->is_regular_file(fec))
                     paths.push_back(it->path().string());
                 it.increment(itec);
-                if (itec)
+                if (itec) {
+                    // A traversal error must not be swallowed: report it and fail the run
+                    // instead of silently importing a truncated file set.
+                    std::fprintf(stderr, "directory traversal aborted: %s\n", itec.message().c_str());
+                    traversal_failed = true;
                     break;
+                }
             }
         } else {
             fs::directory_iterator it(fs::path(args.positional1), fs::directory_options::skip_permission_denied, itec);
+            if (itec) {
+                std::fprintf(stderr, "cannot iterate directory %s: %s\n", args.positional1.c_str(),
+                             itec.message().c_str());
+                store.audit("import", "cli", args.positional1, "failed", "", "{}");
+                return kExitBusinessFailure;
+            }
             for (const auto& entry : it) {
                 std::error_code fec;
                 if (entry.is_regular_file(fec))
@@ -257,6 +274,11 @@ int cmd_import(const Args& args, const streamforge::ConfigSnapshot& cs, Store& s
             break;
         }
     }
+
+    // A failed directory traversal counts as a failed item so the exit code and the audit
+    // record reflect that the submitted file set was truncated.
+    if (traversal_failed)
+        ++failed;
 
     if (args.json_output) {
         json out;
@@ -468,7 +490,15 @@ int cmd_incidents_ack(const Args& args, Store& store) {
 }
 
 int cmd_db_migrate(const Args& args, const streamforge::ConfigSnapshot& cs, Store& store) {
-    int version = schema_version_or(store);
+    auto version_rc = store.schema_version();
+    if (!version_rc.ok() || version_rc.value() < 0) {
+        // A failed version query means the migration state is unknown; do not report "ok".
+        std::fprintf(stderr, "schema version query failed: %s\n",
+                     version_rc.ok() ? "negative version" : version_rc.error().message.c_str());
+        store.audit("db_migrate", "cli", cs.cfg.database.path, "failed", "", "{}");
+        return kExitBusinessFailure;
+    }
+    int version = version_rc.value();
     if (args.json_output) {
         std::printf("%s\n", json{{"schema_version", version}}.dump().c_str());
     } else {
