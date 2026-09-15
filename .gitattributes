@@ -5,3 +5,9 @@
 *.cmake text
 *.yaml text
 *.json text
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
