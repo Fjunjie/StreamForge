@@ -185,6 +185,16 @@ public:
     // Atomically clears staging and marks the file COMPLETED.
     Result<void> finalize_completed(const std::string& file_id);
 
+    // --- missing intervals (M2) ---
+    // INSERT OR IGNORE on (device, metric, start): deterministic re-detection after a
+    // crash must not create duplicate interval rows. Returns true when inserted.
+    Result<bool> insert_missing_interval(const std::string& device_id, const std::string& metric_id, int64_t start_us,
+                                         int64_t end_us, int64_t expected_count);
+
+    // --- watermark / series seeding (M2) ---
+    // MAX(event_time_us) over the device's samples; nullopt when the device has none.
+    Result<std::optional<int64_t>> max_event_time_for_device(const std::string& device_id);
+
     // --- samples ---
     Result<size_t> insert_samples(const std::vector<SampleRow>& rows);
     Result<int64_t> count_samples(const std::string& device_id, const std::string& metric_id, int64_t from_us,

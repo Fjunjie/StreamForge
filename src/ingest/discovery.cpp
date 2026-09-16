@@ -81,11 +81,6 @@ Result<std::vector<ScanHit>> DirectoryScanner::scan() {
             SPDLOG_LOGGER_DEBUG(logger("ingest"), "ignoring unsupported extension: {}", full);
             continue;
         }
-        if (fmt == InputFormat::Tlm) {
-            // TLM processing arrives in M2; discovered but not yet processed.
-            SPDLOG_LOGGER_DEBUG(logger("ingest"), "TLM file deferred to M2: {}", full);
-            continue;
-        }
 
         int64_t size = 0;
         int64_t mtime = stat_mtime_us(entry.path(), size);

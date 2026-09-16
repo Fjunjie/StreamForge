@@ -795,6 +795,41 @@ Result<void> Store::commit_stage2_batch(const std::string& file_id, const std::v
     return Result<void>::Ok();
 }
 
+Result<bool> Store::insert_missing_interval(const std::string& device_id, const std::string& metric_id,
+                                            int64_t start_us, int64_t end_us, int64_t expected_count) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("INSERT OR IGNORE INTO missing_intervals(device_id, metric_id, start_us,"
+                          " end_us, expected_count, created_at_us) VALUES(?, ?, ?, ?, ?, ?)");
+    if (!st.ok())
+        return Result<bool>::Err(st.error());
+    st.value().bind_text(1, device_id);
+    st.value().bind_text(2, metric_id);
+    st.value().bind_int64(3, start_us);
+    st.value().bind_int64(4, end_us);
+    st.value().bind_int64(5, expected_count);
+    st.value().bind_int64(6, now_unix_us());
+    auto step = st.value().step();
+    if (!step.ok() || step.value() != Stmt::Step::Done) {
+        return Result<bool>::Err(Error::make(ErrorCode::DbStep, "missing interval insert failed"));
+    }
+    return Result<bool>::Ok(db_.changes() > 0);
+}
+
+Result<std::optional<int64_t>> Store::max_event_time_for_device(const std::string& device_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT MAX(event_time_us) FROM samples WHERE device_id=?");
+    if (!st.ok())
+        return Result<std::optional<int64_t>>::Err(st.error());
+    st.value().bind_text(1, device_id);
+    auto step = st.value().step();
+    if (!step.ok() || step.value() != Stmt::Step::Row) {
+        return Result<std::optional<int64_t>>::Err(Error::make(ErrorCode::DbStep, "max event time query failed"));
+    }
+    if (st.value().column_is_null(0))
+        return Result<std::optional<int64_t>>::Ok(std::nullopt);
+    return Result<std::optional<int64_t>>::Ok(st.value().column_int64(0));
+}
+
 Result<void> Store::finalize_completed(const std::string& file_id) {
     std::lock_guard<std::mutex> lock(mu_);
     auto txn = Txn::begin(db_);
