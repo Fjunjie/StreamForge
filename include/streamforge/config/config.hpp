@@ -99,6 +99,7 @@ struct PipelineConfig {
     int64_t shutdown_timeout_us = 25LL * 1000000;
     int64_t history_range_us = 7LL * 24 * 3600 * 1000000;
     AmbiguousTimePolicy ambiguous_time_policy = AmbiguousTimePolicy::Earlier;
+    bool window_correction = false; // FR-AGG-003: late data reopens closed windows with a new version
 };
 
 struct RetentionConfig {

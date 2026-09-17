@@ -10,6 +10,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "streamforge/core/time.hpp"
+#include "streamforge/core/units.hpp"
 
 namespace streamforge {
 
@@ -262,7 +263,8 @@ uint64_t compute_config_version(const Config& cfg) {
           << ",lat=" << cfg.pipeline.allowed_lateness_us << ",scan=" << cfg.pipeline.scan_interval_ms
           << ",quiet=" << cfg.pipeline.quiet_period_ms << ",rate=" << cfg.pipeline.max_error_rate
           << ",minr=" << cfg.pipeline.error_rate_min_records << ",hist=" << cfg.pipeline.history_range_us
-          << ",amb=" << (cfg.pipeline.ambiguous_time_policy == AmbiguousTimePolicy::Earlier ? "e" : "l");
+          << ",amb=" << (cfg.pipeline.ambiguous_time_policy == AmbiguousTimePolicy::Earlier ? "e" : "l")
+          << ",wc=" << (cfg.pipeline.window_correction ? 1 : 0);
     canon << "|win=";
     for (auto w : cfg.windows)
         canon << w << ",";
@@ -395,7 +397,7 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
         check_keys(p,
                    {"workers", "queue_capacity", "batch_size", "allowed_lateness", "scan_interval", "quiet_period",
                     "max_error_rate", "error_rate_min_records", "shutdown_timeout", "history_range",
-                    "ambiguous_time_policy"},
+                    "ambiguous_time_policy", "window_correction"},
                    "pipeline", warnings);
         c.pipeline.workers = static_cast<int>(optional_int(p, "workers", c.pipeline.workers, "pipeline", errors));
         c.pipeline.queue_capacity = optional_int(p, "queue_capacity", c.pipeline.queue_capacity, "pipeline", errors);
@@ -425,6 +427,7 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                     .ctx("location", "pipeline")
                     .ctx("value", amb));
         }
+        c.pipeline.window_correction = optional_string(p, "window_correction", "false") == "true";
     }
     if (c.pipeline.workers < 1 || c.pipeline.workers > 64) {
         errors.push_back(
@@ -597,6 +600,31 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                             .ctx("location", where)
                             .ctx("value", m.canonical_unit));
                 }
+                // Unit conversion validation (FR-VAL-004): every unit must be known and all
+                // units of one metric must belong to the same dimension.
+                if (valid_unit(m.canonical_unit)) {
+                    const auto* canonical = core_units::find_unit(m.canonical_unit);
+                    if (canonical == nullptr) {
+                        errors.push_back(Error::make(ErrorCode::ConfigValidation, "canonical_unit is not a known unit")
+                                             .ctx("location", where)
+                                             .ctx("value", m.canonical_unit));
+                    } else {
+                        for (const auto& unit : m.input_units) {
+                            const auto* info = core_units::find_unit(unit);
+                            if (info == nullptr) {
+                                errors.push_back(
+                                    Error::make(ErrorCode::ConfigValidation, "input unit is not a known unit")
+                                        .ctx("location", where)
+                                        .ctx("value", unit));
+                            } else if (info->dimension != canonical->dimension) {
+                                errors.push_back(Error::make(ErrorCode::ConfigValidation,
+                                                             "input unit dimension differs from the canonical unit")
+                                                     .ctx("location", where)
+                                                     .ctx("value", unit));
+                            }
+                        }
+                    }
+                }
                 if (m.interpolation != Interpolation::None && !m.expected_period_us) {
                     errors.push_back(
                         Error::make(ErrorCode::ConfigValidation, "interpolation requires 'expected_period'")
@@ -679,6 +707,7 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
     if (const YAML::Node cs = root["calibrations"]) {
         if (cs.IsSequence()) {
             int index = 0;
+            std::set<std::string> calibration_keys;
             for (const auto& item : cs) {
                 std::string where = "calibrations[" + std::to_string(index) + "]";
                 ++index;
@@ -686,6 +715,15 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                 DeviceCalibration dc;
                 dc.device_id = require_string(item, "device", where, errors);
                 dc.metric_id = require_string(item, "metric", where, errors);
+                // Audit #16: duplicate (device, metric) calibration entries would silently
+                // shadow each other — reject them like duplicate metric ids.
+                std::string calib_key = dc.device_id + "/" + dc.metric_id;
+                if (!calib_key.empty() && dc.metric_id != "" && !calibration_keys.insert(calib_key).second) {
+                    errors.push_back(Error::make(ErrorCode::ConfigValidation,
+                                                 "duplicate calibration entry for device '" + dc.device_id +
+                                                     "' and metric '" + dc.metric_id + "'")
+                                         .ctx("location", where));
+                }
                 dc.calibration.reject_unmatched = optional_string(item, "reject_unmatched", "false") == "true";
                 if (const YAML::Node segs = item["segments"]) {
                     if (!segs.IsSequence() || segs.size() == 0) {

@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "streamforge/core/fs_util.hpp"
 #include "streamforge/core/log.hpp"
 #include "streamforge/core/time.hpp"
 #include "streamforge/core/uuid.hpp"
@@ -16,6 +17,7 @@
 #include "streamforge/ingest/error_report.hpp"
 #include "streamforge/ingest/format.hpp"
 #include "streamforge/ingest/jsonl_parser.hpp"
+#include "streamforge/ingest/tlm_parser.hpp"
 #include "streamforge/ingest/validation.hpp"
 
 namespace streamforge {
@@ -106,7 +108,7 @@ ImportPipeline::ProcessResult ImportPipeline::handle_existing(const storage::Sou
     const auto& cp_row = cp.value();
     if (row.status == FileStatus::Stage1Processing) {
         return run_stage1(row, identity.value(), true, cp_row ? cp_row->stage1_offset : 0,
-                          cp_row ? cp_row->stage1_line : 0);
+                          cp_row ? cp_row->stage1_line : 0, cp_row ? cp_row->stage1_tlm_seq : 0);
     }
     // VALIDATED / PROCESSING_STAGE2: continue stage 2.
     auto stage2 = run_stage2(row);
@@ -131,7 +133,8 @@ ImportPipeline::ProcessResult ImportPipeline::start_new_file(const FileIdentity&
     const storage::SourceFileRow* latest_row = nullptr;
     if (latest.ok()) {
         const auto& latest_opt = latest.value();
-        if (latest_opt) latest_row = &*latest_opt;
+        if (latest_opt)
+            latest_row = &*latest_opt;
     }
     if (latest_row && file_status_recoverable(latest_row->status)) {
         store_->update_file_status(latest_row->id, FileStatus::SourceChanged);
@@ -158,11 +161,8 @@ ImportPipeline::ProcessResult ImportPipeline::start_new_file(const FileIdentity&
         size_t dot = name.find_last_of('.');
         return dot == std::string::npos ? std::string() : name.substr(dot + 1);
     }());
-    if (fmt != InputFormat::Csv && fmt != InputFormat::Jsonl) {
-        result.error = Error::make(ErrorCode::FormatUnsupported, fmt == InputFormat::Tlm
-                                                                     ? "TLM ingestion is delivered in milestone M2"
-                                                                     : "unsupported input format")
-                           .ctx("path", identity.path);
+    if (fmt == InputFormat::Unknown) {
+        result.error = Error::make(ErrorCode::FormatUnsupported, "unsupported input format").ctx("path", identity.path);
         return result;
     }
     row.format = format_name(fmt);
@@ -172,12 +172,13 @@ ImportPipeline::ProcessResult ImportPipeline::start_new_file(const FileIdentity&
         result.error = ins.error();
         return result;
     }
-    return run_stage1(row, identity, false, 0, 0);
+    return run_stage1(row, identity, false, 0, 0, 0);
 }
 
 ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFileRow& row,
                                                          const FileIdentity& identity, bool resume,
-                                                         int64_t resume_offset, int64_t resume_line_base) {
+                                                         int64_t resume_offset, int64_t resume_line_base,
+                                                         int64_t resume_tlm_sequence) {
     ProcessResult result;
     result.file_id = row.id;
 
@@ -326,7 +327,7 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
                 }
             }
         }
-    } else {
+    } else if (row.format == format_name(InputFormat::Jsonl)) {
         JsonlParser parser(in);
         if (resume && resume_offset > 0) {
             in.clear();
@@ -400,6 +401,108 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
             }
             ctx.cp.stage1_offset = parser.current_offset();
             ctx.cp.stage1_line = resume_line_base + next.record.line_no;
+            if (static_cast<int64_t>(batch.size()) >= batch_size) {
+                auto flushed = flush(false);
+                if (flushed == ProcessResult::Outcome::Interrupted) {
+                    result.outcome = ProcessResult::Outcome::Interrupted;
+                    return result;
+                }
+                if (flushed == ProcessResult::Outcome::Failed) {
+                    result.error = Error::make(ErrorCode::DbExec, "staging batch commit failed");
+                    return result;
+                }
+            }
+        }
+    } else { // TLM (M2): frames decoded via the C11 codec; resync marks records suspicious.
+        TlmParser parser(in);
+        if (resume && resume_offset > 0) {
+            in.clear();
+            in.seekg(resume_offset);
+            if (!in) {
+                result.error = Error::make(ErrorCode::IoRead, "cannot seek to checkpoint")
+                                   .ctx("path", identity.path)
+                                   .ctx("offset", std::to_string(resume_offset));
+                return result;
+            }
+            parser.seek_to(resume_offset);
+            // The last accepted frame sequence is persisted in the checkpoint's
+            // stage1_tlm_seq column while the file is in stage 1.
+            if (resume_tlm_sequence > 0)
+                parser.set_last_sequence(static_cast<uint64_t>(resume_tlm_sequence));
+        }
+        while (true) {
+            auto next = parser.next();
+            if (next.kind == TlmParser::Next::Kind::Eof)
+                break;
+            if (should_stop && should_stop()) {
+                result.outcome = ProcessResult::Outcome::Interrupted;
+                return result;
+            }
+            storage::StagedRecord staged;
+            staged.ingest_time_us = to_unix_us(ingest_start);
+            staged.line_no = resume_line_base + next.record.position; // frame offset as line no
+            staged.position = next.record.position;
+            if (next.kind == TlmParser::Next::Kind::Fatal) {
+                // Invalid file header: quarantine like the CSV bad-header path.
+                auto finalized =
+                    store_->finalize_quarantine(row.id, error_summary_json(next.error.code_name(), next.error.message));
+                if (!finalized.ok()) {
+                    result.error = finalized.error();
+                    return result;
+                }
+                return quarantine_now(row, next.error.code_name(), "file could not be parsed: " + next.error.message,
+                                      ctx);
+            }
+            if (next.kind == TlmParser::Next::Kind::SkipRecord) {
+                staged.status = StagedStatus::FormatError;
+                staged.error_code = next.error.code_value();
+                staged.error_message = next.error.message;
+                ctx.counts.record_count++;
+                ctx.counts.format_errors++;
+                batch.push_back(std::move(staged));
+            } else {
+                auto outcome = validate_record(next.record, *cs_, ingest_start);
+                ctx.counts.record_count++;
+                if (outcome.kind == ValidationKind::Accepted) {
+                    staged.status = StagedStatus::Accepted;
+                    staged.device_id = next.record.device_id;
+                    staged.metric = next.record.metric;
+                    staged.has_event_time = true;
+                    staged.event_time_us = to_unix_us(outcome.event_time);
+                    staged.has_value = next.record.has_value;
+                    staged.value_is_null = next.record.value_is_null;
+                    staged.value = next.record.value;
+                    staged.unit = next.record.unit;
+                    staged.quality = next.record.has_quality ? next.record.quality : 0;
+                    staged.has_sequence = next.record.has_sequence;
+                    staged.sequence = next.record.sequence;
+                    staged.tags_json = tags_to_json(next.record.tags, outcome.leap_second);
+                    ctx.counts.accepted_count++;
+                } else {
+                    staged.status = outcome.kind == ValidationKind::BusinessError ? StagedStatus::BusinessError
+                                                                                  : StagedStatus::FormatError;
+                    staged.error_code = outcome.error.code_value();
+                    staged.error_message = outcome.error.message;
+                    if (outcome.kind == ValidationKind::BusinessError) {
+                        ctx.counts.business_errors++;
+                    } else {
+                        ctx.counts.format_errors++;
+                    }
+                    if (static_cast<int64_t>(ctx.sample_errors.size()) < 100) {
+                        SampleError se;
+                        se.line_no = staged.line_no;
+                        se.code = outcome.error.code_name();
+                        se.message = outcome.error.message;
+                        se.raw = next.record.raw_prefix;
+                        ctx.sample_errors.push_back(std::move(se));
+                    }
+                }
+                batch.push_back(std::move(staged));
+            }
+            ctx.cp.stage1_offset = parser.current_offset();
+            // TLM frame sequence lives in its own checkpoint column; stage2_cursor stays 0
+            // until stage 2 begins (it is the staging-row cursor there).
+            ctx.cp.stage1_tlm_seq = parser.has_last_sequence() ? static_cast<int64_t>(parser.last_sequence()) : 0;
             if (static_cast<int64_t>(batch.size()) >= batch_size) {
                 auto flushed = flush(false);
                 if (flushed == ProcessResult::Outcome::Interrupted) {
@@ -496,71 +599,6 @@ ImportPipeline::ProcessResult ImportPipeline::quarantine_now(const storage::Sour
     return result;
 }
 
-Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
-    auto cp = store_->get_checkpoint(row.id);
-    if (!cp.ok())
-        return Result<void>::Err(cp.error());
-    const auto& cp_row = cp.value();
-    int64_t cursor = cp_row ? cp_row->stage2_cursor : 0;
-    const int64_t batch_size = cs_->cfg.pipeline.batch_size;
-
-    while (true) {
-        auto rows = store_->load_staging(row.id, cursor, batch_size);
-        if (!rows.ok())
-            return Result<void>::Err(rows.error());
-        if (rows.value().empty())
-            break;
-        if (should_stop && should_stop()) {
-            return Result<void>::Err(Error::make(ErrorCode::Interrupted, "stage 2 interrupted"));
-        }
-
-        std::vector<storage::SampleRow> samples;
-        for (const auto& staged : rows.value()) {
-            if (staged.status != StagedStatus::Accepted)
-                continue;
-            storage::SampleRow s;
-            s.sample_uuid = uuid_v4();
-            s.device_id = staged.device_id;
-            s.metric_id = staged.metric;
-            s.event_time_us = staged.event_time_us;
-            s.ingest_time_us = staged.ingest_time_us;
-            s.value_is_null = staged.value_is_null;
-            s.value = staged.value;
-            s.input_unit = staged.unit;
-            s.quality = staged.quality;
-            s.source_file_id = row.id;
-            s.source_position = staged.line_no;
-            s.has_sequence = staged.has_sequence;
-            s.sequence = staged.sequence;
-            s.flags = 0;
-            s.config_version = static_cast<int64_t>(cs_->version);
-            s.tags_json = staged.tags_json;
-            samples.push_back(std::move(s));
-        }
-
-        if (fault_injector && fault_injector(++fault_batch_counter_)) {
-            return Result<void>::Err(Error::make(ErrorCode::Interrupted, "simulated crash"));
-        }
-
-        int64_t max_seq = rows.value().back().seq;
-        auto rc = store_->commit_stage2_batch(row.id, samples, max_seq);
-        if (!rc.ok())
-            return Result<void>::Err(rc.error());
-        cursor = max_seq;
-    }
-
-    auto done = store_->finalize_completed(row.id);
-    if (!done.ok())
-        return Result<void>::Err(done.error());
-
-    // Archive after the transaction; a crash here is healed by recover_pending().
-    auto moved = archive_file(row.path, cs_->cfg.directories.archive, row.identity_hash);
-    if (!moved.ok()) {
-        SPDLOG_LOGGER_ERROR(logger("ingest"), "archive move failed for {}: {}", row.path, moved.error().message);
-    }
-    return Result<void>::Ok();
-}
-
 Result<ImportPipeline::RecoveryStats> ImportPipeline::recover_pending() {
     RecoveryStats stats;
     auto pending =
@@ -630,4 +668,338 @@ Result<ImportPipeline::RecoveryStats> ImportPipeline::recover_pending() {
     return Result<RecoveryStats>::Ok(stats);
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2 (M2): the formal processing chain
+// ---------------------------------------------------------------------------
+
+// Rebuilds the in-memory processing context for one file. All durable state lives in the
+// database, so a crash at any point is healed by replaying from the stage-2 cursor.
+void ImportPipeline::init_stage2_context(const storage::SourceFileRow& row) {
+    (void)row;
+    dedup_ = std::make_unique<processing::DedupIndex>(*store_);
+    windows_ = std::make_unique<processing::WindowAggregator>(*cs_, *store_);
+    emitted_ = std::make_unique<std::vector<processing::NormalizedSample>>();
+    synth_buffer_ = std::make_unique<std::vector<processing::NormalizedSample>>();
+    interval_buffer_ = std::make_unique<std::vector<processing::GapDetector::MissingInterval>>();
+    reorder_ = std::make_unique<processing::ReorderBuffer>(
+        cs_->cfg.pipeline.allowed_lateness_us, 100000, 64u * 1024u * 1024u,
+        [this](processing::NormalizedSample&& s) { emitted_->push_back(std::move(s)); });
+    gaps_ = std::make_unique<processing::GapDetector>(
+        *cs_, [this](processing::NormalizedSample&& s) { synth_buffer_->push_back(std::move(s)); },
+        [this](const processing::GapDetector::MissingInterval& iv) { interval_buffer_->push_back(iv); });
+    seeded_devices_.clear();
+}
+
+// Seeds the device watermark from durable history so cross-file lateness is detected:
+// a backfilled file older than the stream gets kLate flags and respects closed windows.
+// A failed seed query is an error (not silently swallowed): late detection would be
+// disabled for the device, so the failure propagates and stage 2 retries on the next run.
+Result<void> ImportPipeline::ensure_device_seeded(const std::string& device_id) {
+    if (seeded_devices_.count(device_id))
+        return Result<void>::Ok();
+    auto max_us = store_->max_event_time_for_device(device_id);
+    if (!max_us.ok())
+        return Result<void>::Err(max_us.error());
+    seeded_devices_.insert(device_id);
+    const auto& max_opt = max_us.value();
+    if (max_opt.has_value())
+        reorder_->seed_device(device_id, *max_opt);
+    return Result<void>::Ok();
+}
+
+// Normalizes one staged record: calibration -> unit conversion -> validity range
+// (requirements FR-VAL-003/FR-VAL-004). Null values pass through untouched.
+Result<processing::NormalizedSample> ImportPipeline::normalize_staged(const storage::StagedRecord& r) const {
+    processing::NormalizedSample s;
+    s.device_id = r.device_id;
+    s.metric_id = r.metric;
+    s.event_time_us = r.event_time_us;
+    s.ingest_time_us = r.ingest_time_us;
+    s.quality = r.quality;
+    s.has_sequence = r.has_sequence;
+    s.sequence = r.sequence;
+    s.tags_json = r.tags_json;
+    s.input_unit = r.unit;
+    s.source_position = r.line_no;
+    if (r.value_is_null) {
+        s.value_is_null = true;
+        return Result<processing::NormalizedSample>::Ok(std::move(s));
+    }
+    const MetricCfg* metric = cs_->metric(r.metric);
+    if (metric == nullptr) {
+        return Result<processing::NormalizedSample>::Err(
+            Error::make(ErrorCode::ValidationMetricUnknown, "metric missing from configuration")
+                .ctx("metric", r.metric));
+    }
+    double calibrated = r.value;
+    auto cal = streamforge::processing::apply_calibration(*cs_, r.device_id, r.metric, r.value, &calibrated);
+    if (!cal.ok())
+        return Result<processing::NormalizedSample>::Err(cal.error());
+    auto conv = core_units::convert_unit(r.unit, metric->canonical_unit, calibrated);
+    if (!conv.ok())
+        return Result<processing::NormalizedSample>::Err(conv.error());
+    double canonical = conv.value();
+    if ((metric->valid_min && canonical < *metric->valid_min) ||
+        (metric->valid_max && canonical > *metric->valid_max)) {
+        return Result<processing::NormalizedSample>::Err(
+            Error::make(ErrorCode::ValidationValueInvalid, "value outside the configured valid range")
+                .ctx("metric", r.metric)
+                .ctx("value", std::to_string(canonical)));
+    }
+    s.value = canonical;
+    return Result<processing::NormalizedSample>::Ok(std::move(s));
+}
+
+// Processes one normalized sample: dedup pre-check, sample row for the current batch and
+// window registration (closed windows are skipped; only correction may touch them).
+Result<void> ImportPipeline::process_emitted(const storage::SourceFileRow& file, processing::NormalizedSample& s,
+                                             bool synthetic, std::vector<storage::SampleRow>& out) {
+    if (synthetic)
+        s.flags |= sample_flags::kSynthetic;
+    windows_->on_sample(s);
+    if (!synthetic) {
+        auto dup = dedup_->is_duplicate(s);
+        if (!dup.ok())
+            return Result<void>::Err(dup.error());
+        if (dup.value())
+            return Result<void>::Ok();
+    }
+    storage::SampleRow out_row;
+    out_row.sample_uuid = uuid_v4();
+    out_row.device_id = s.device_id;
+    out_row.metric_id = s.metric_id;
+    out_row.event_time_us = s.event_time_us;
+    out_row.ingest_time_us = s.ingest_time_us;
+    out_row.value_is_null = s.value_is_null;
+    out_row.value = s.value;
+    out_row.input_unit = s.input_unit; // provenance: the pre-conversion unit
+    out_row.quality = s.quality;
+    out_row.source_file_id = file.id;
+    out_row.source_position = s.source_position;
+    out_row.has_sequence = s.has_sequence;
+    out_row.sequence = s.sequence;
+    out_row.flags = s.flags;
+    out_row.config_version = static_cast<int64_t>(cs_->version);
+    out_row.tags_json = s.tags_json;
+    out_row.normalized_value = processing::normalized_value_text(s.value_is_null, s.value);
+    out.push_back(std::move(out_row));
+    dedup_->mark_seen(s);
+    return Result<void>::Ok();
+}
+
+Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
+    auto cp = store_->get_checkpoint(row.id);
+    if (!cp.ok())
+        return Result<void>::Err(cp.error());
+    const auto& cp_row = cp.value();
+    int64_t cursor = cp_row ? cp_row->stage2_cursor : 0;
+    const int64_t batch_size = cs_->cfg.pipeline.batch_size;
+
+    init_stage2_context(row);
+    std::vector<processing::NormalizedSample> late_corrections;
+    std::vector<SampleError> stage2_errors;
+    int64_t stage2_dropped = 0;
+
+    while (true) {
+        auto rows = store_->load_staging(row.id, cursor, batch_size);
+        if (!rows.ok())
+            return Result<void>::Err(rows.error());
+        if (rows.value().empty())
+            break;
+        if (should_stop && should_stop()) {
+            return Result<void>::Err(Error::make(ErrorCode::Interrupted, "stage 2 interrupted"));
+        }
+
+        std::vector<storage::SampleRow> samples;
+        std::set<std::string> touched_devices;
+        for (const auto& staged : rows.value()) {
+            if (staged.status != StagedStatus::Accepted)
+                continue;
+            auto seeded = ensure_device_seeded(staged.device_id);
+            if (!seeded.ok())
+                return Result<void>::Err(seeded.error());
+            touched_devices.insert(staged.device_id);
+
+            auto normalized = normalize_staged(staged);
+            if (!normalized.ok()) {
+                // Calibration/conversion/range rejections count as stage-2 business errors.
+                ++stage2_dropped;
+                if (static_cast<int64_t>(stage2_errors.size()) < 100) {
+                    SampleError se;
+                    se.line_no = staged.line_no;
+                    se.code = normalized.error().code_name();
+                    se.message = normalized.error().message;
+                    se.raw = sanitize_raw(staged.tags_json, 64);
+                    stage2_errors.push_back(std::move(se));
+                }
+                SPDLOG_LOGGER_DEBUG(logger("ingest"), "stage 2 dropped record: {}", normalized.error().message);
+                continue;
+            }
+            reorder_->push(std::move(normalized.value()));
+
+            // Drain everything the reorder buffer released (ordered per device); late
+            // corrections run after the batch commit so windows read committed data.
+            for (auto& s : *emitted_) {
+                auto rc = process_emitted(row, s, false, samples);
+                if (!rc.ok())
+                    return Result<void>::Err(rc.error());
+                if ((s.flags & sample_flags::kLate) != 0)
+                    late_corrections.push_back(s);
+                gaps_->feed(s);
+            }
+            emitted_->clear();
+            // Synthetic interpolation samples join the same batch; the gap that produced
+            // them is already closed by their real endpoints (no gap feed).
+            for (auto& s : *synth_buffer_) {
+                auto rc = process_emitted(row, s, true, samples);
+                if (!rc.ok())
+                    return Result<void>::Err(rc.error());
+            }
+            synth_buffer_->clear();
+            for (const auto& iv : *interval_buffer_) {
+                auto ins = store_->insert_missing_interval(iv.device_id, iv.metric_id, iv.start_us, iv.end_us,
+                                                           iv.expected_count);
+                if (!ins.ok())
+                    return Result<void>::Err(ins.error());
+            }
+            interval_buffer_->clear();
+        }
+
+        // Before the cursor may advance, every buffered sample must be durable: drain the
+        // reorder buffers (end-of-batch drain, no forced_flush flag) so "cursor advanced"
+        // always implies "samples committed". This keeps the buffer bounded per batch and
+        // makes crash recovery exact (replay starts from the committed cursor).
+        for (const auto& device : touched_devices) {
+            reorder_->flush_device(device, /*mark_forced=*/false);
+            for (auto& s : *emitted_) {
+                auto rc = process_emitted(row, s, false, samples);
+                if (!rc.ok())
+                    return Result<void>::Err(rc.error());
+                if ((s.flags & sample_flags::kLate) != 0)
+                    late_corrections.push_back(s);
+                gaps_->feed(s);
+            }
+            emitted_->clear();
+            for (auto& s : *synth_buffer_) {
+                auto rc = process_emitted(row, s, true, samples);
+                if (!rc.ok())
+                    return Result<void>::Err(rc.error());
+            }
+            synth_buffer_->clear();
+            for (const auto& iv : *interval_buffer_) {
+                auto ins = store_->insert_missing_interval(iv.device_id, iv.metric_id, iv.start_us, iv.end_us,
+                                                           iv.expected_count);
+                if (!ins.ok())
+                    return Result<void>::Err(ins.error());
+            }
+            interval_buffer_->clear();
+        }
+
+        if (fault_injector && fault_injector(++fault_batch_counter_)) {
+            return Result<void>::Err(Error::make(ErrorCode::Interrupted, "simulated crash"));
+        }
+
+        int64_t max_seq = rows.value().back().seq;
+        auto rc = store_->commit_stage2_batch(row.id, samples, max_seq);
+        if (!rc.ok())
+            return Result<void>::Err(rc.error());
+        cursor = max_seq;
+
+        // Durable now: advance window closing to the watermark, apply late corrections.
+        for (const auto& device : touched_devices) {
+            auto wm = reorder_->watermark(device);
+            if (wm != INT64_MIN) {
+                auto closed = windows_->on_watermark(device, wm);
+                if (!closed.ok())
+                    return Result<void>::Err(closed.error());
+            }
+        }
+        for (const auto& s : late_corrections) {
+            auto corrected = windows_->correct_for_sample(s);
+            if (!corrected.ok())
+                return Result<void>::Err(corrected.error());
+        }
+        late_corrections.clear();
+    }
+
+    // End of file: drain the reorder buffers (regular end-of-stream, no forced_flush
+    // flag), commit the tail, then close every window this file touched. Window closing
+    // recomputes from the samples table, so it is idempotent and crash-safe.
+    std::vector<storage::SampleRow> tail_samples;
+    std::vector<processing::NormalizedSample> tail_late;
+    for (const auto& device : seeded_devices_) {
+        reorder_->flush_device(device, /*mark_forced=*/false);
+        for (auto& s : *emitted_) {
+            auto rc = process_emitted(row, s, false, tail_samples);
+            if (!rc.ok())
+                return Result<void>::Err(rc.error());
+            // Tail late samples must receive the same correction treatment as the main
+            // loop (audit #5): collect and apply after the samples are durable.
+            if ((s.flags & sample_flags::kLate) != 0)
+                tail_late.push_back(s);
+            gaps_->feed(s);
+        }
+        emitted_->clear();
+        for (auto& s : *synth_buffer_) {
+            auto rc = process_emitted(row, s, true, tail_samples);
+            if (!rc.ok())
+                return Result<void>::Err(rc.error());
+        }
+        synth_buffer_->clear();
+        for (const auto& iv : *interval_buffer_) {
+            auto ins =
+                store_->insert_missing_interval(iv.device_id, iv.metric_id, iv.start_us, iv.end_us, iv.expected_count);
+            if (!ins.ok())
+                return Result<void>::Err(ins.error());
+        }
+        interval_buffer_->clear();
+    }
+    if (!tail_samples.empty()) {
+        auto rc = store_->insert_samples(tail_samples);
+        if (!rc.ok())
+            return Result<void>::Err(rc.error());
+        tail_samples.clear();
+    }
+    // Corrections read the committed samples table, so apply after the tail insert.
+    for (const auto& s : tail_late) {
+        auto corrected = windows_->correct_for_sample(s);
+        if (!corrected.ok())
+            return Result<void>::Err(corrected.error());
+    }
+    tail_late.clear();
+    for (const auto& device : seeded_devices_) {
+        auto wm = reorder_->watermark(device);
+        if (wm != INT64_MIN) {
+            auto closed = windows_->on_watermark(device, wm);
+            if (!closed.ok())
+                return Result<void>::Err(closed.error());
+        }
+        auto all = windows_->close_all(device);
+        if (!all.ok())
+            return Result<void>::Err(all.error());
+    }
+
+    if (stage2_dropped > 0) {
+        SPDLOG_LOGGER_INFO(logger("ingest"), "file {}: stage 2 dropped {} records", row.path, stage2_dropped);
+    }
+    if (stage2_dropped > 0) {
+        // Stage-2 rejections shrink the accepted count and grow the business error count.
+        auto counts = storage::FileCounts{row.record_count, row.accepted_count - stage2_dropped, row.format_errors,
+                                          row.business_errors + stage2_dropped};
+        auto updated = store_->update_file_counts(row.id, counts);
+        if (!updated.ok())
+            return Result<void>::Err(updated.error());
+    }
+
+    auto done = store_->finalize_completed(row.id);
+    if (!done.ok())
+        return Result<void>::Err(done.error());
+
+    // Archive after the transaction; a crash here is healed by recover_pending().
+    auto moved = archive_file(row.path, cs_->cfg.directories.archive, row.identity_hash);
+    if (!moved.ok()) {
+        SPDLOG_LOGGER_ERROR(logger("ingest"), "archive move failed for {}: {}", row.path, moved.error().message);
+    }
+    return Result<void>::Ok();
+}
 } // namespace streamforge
