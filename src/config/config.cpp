@@ -828,6 +828,23 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                             .ctx("location", where)
                             .ctx("value", r.severity));
                 }
+                // M3 fields: trigger expression, recovery expression, timing, device selector.
+                r.trigger = require_string(item, "trigger", where, errors);
+                r.recovery = optional_string(item, "recovery", "");
+                r.duration_us = require_duration(item, "duration", where, errors, 0);
+                r.cooldown_us = require_duration(item, "cooldown", where, errors, 0);
+                r.merge_interval_us = require_duration(item, "merge_interval", where, errors, 0);
+                if (const YAML::Node dev_sel = item["devices"]) {
+                    if (dev_sel.IsMap()) {
+                        for (const auto& t : dev_sel) {
+                            r.devices.emplace_back(t.first.as<std::string>(), t.second.as<std::string>());
+                        }
+                    } else {
+                        errors.push_back(
+                            Error::make(ErrorCode::ConfigValidation, "'devices' must be a string->string map")
+                                .ctx("location", where));
+                    }
+                }
                 c.rules.push_back(std::move(r));
             }
         } else {
