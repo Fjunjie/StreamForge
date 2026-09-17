@@ -64,6 +64,7 @@ struct CheckpointRow {
     int64_t stage1_offset = 0;
     int64_t stage1_line = 0;
     int64_t stage2_cursor = 0;
+    int64_t stage1_tlm_seq = 0; // last accepted TLM frame sequence during stage 1
     int64_t updated_at_us = 0;
 };
 

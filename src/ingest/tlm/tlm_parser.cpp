@@ -42,22 +42,26 @@ void TlmParser::set_last_sequence(uint64_t sequence) {
 TlmParser::Fill TlmParser::refill() {
     if (eof_)
         return Fill::Eof;
-    // Compact: drop consumed bytes so the read window never grows without bound.
+    // Compact: move the unconsumed tail to the front; the append point is its end.
+    // (Audit #7: reading from the head would overwrite the unconsumed window whenever
+    // a frame spans the read boundary — data loss on any stream larger than one window.)
     if (buf_begin_ > 0) {
         buf_.erase(buf_.begin(), buf_.begin() + static_cast<long>(buf_begin_));
         seek_base_ += static_cast<int64_t>(buf_begin_);
         buf_begin_ = 0;
     }
-    if (buf_.size() == buf_begin_ || buf_.size() - buf_begin_ < 4096) {
-        buf_.resize(std::max(kInitialBuffer, buf_.size() * 2));
-    }
-    in_.read(reinterpret_cast<char*>(buf_.data() + buf_begin_), static_cast<std::streamsize>(buf_.size() - buf_begin_));
+    const size_t tail = buf_.size(); // unconsumed bytes kept in place
+    if (buf_.size() < kInitialBuffer)
+        buf_.resize(kInitialBuffer);
+    else if (buf_.size() - tail < 4096)
+        buf_.resize(buf_.size() * 2); // make room to append after the tail
+    in_.read(reinterpret_cast<char*>(buf_.data() + tail), static_cast<std::streamsize>(buf_.size() - tail));
     const auto got = static_cast<size_t>(in_.gcount());
     if (got == 0) {
         eof_ = true;
         return Fill::Eof;
     }
-    buf_.resize(buf_begin_ + got); // keep only real content
+    buf_.resize(tail + got); // keep only real content
     if (in_.eof())
         eof_ = true; // stream exhausted beyond this window
     return Fill::Got;

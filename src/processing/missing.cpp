@@ -62,10 +62,8 @@ void GapDetector::feed(const NormalizedSample& sample) {
     const LastValid prev = it->second;
     const int64_t gap = sample.event_time_us - prev.time_us;
     if (gap <= 0) {
-        // Out-of-order or duplicate arrival: keep the newest state.
-        if (sample.event_time_us > prev.time_us) {
-            it->second = LastValid{sample.event_time_us, sample.value};
-        }
+        // Out-of-order or duplicate arrival: the last-valid state already reflects the
+        // newest event time (audit #1: sample.time <= prev.time here, so no refresh).
         return;
     }
 

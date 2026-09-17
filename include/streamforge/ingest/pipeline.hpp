@@ -86,7 +86,7 @@ private:
     // missing/interpolation and window aggregation over one file's staged records.
     Result<void> run_stage2(const storage::SourceFileRow& row);
     void init_stage2_context(const storage::SourceFileRow& row);
-    void ensure_device_seeded(const std::string& device_id);
+    [[nodiscard]] Result<void> ensure_device_seeded(const std::string& device_id);
     // Normalizes one staged record: calibration -> unit conversion -> validity range.
     [[nodiscard]] Result<processing::NormalizedSample> normalize_staged(const storage::StagedRecord& r) const;
     // Processes one normalized sample: dedup pre-check, sample row for the current batch

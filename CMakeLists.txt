@@ -143,7 +143,7 @@ add_library(sf_ingest STATIC
     src/ingest/archive.cpp
     src/ingest/error_report.cpp
     src/ingest/pipeline.cpp)
-target_link_libraries(sf_ingest PUBLIC sf_storage tlmcodec PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+target_link_libraries(sf_ingest PUBLIC sf_storage sf_processing tlmcodec PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
 sf_add_warnings(sf_ingest)
 
 add_library(sf_processing STATIC
@@ -194,6 +194,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_storage.cpp
         tests/unit/test_ingest.cpp
         tests/unit/test_pipeline.cpp
+        tests/unit/test_consistency.cpp
         tests/integration/test_cli.cpp)
     target_include_directories(streamforge-tests PRIVATE tests)
     target_compile_definitions(streamforge-tests PRIVATE

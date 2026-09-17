@@ -108,7 +108,7 @@ ImportPipeline::ProcessResult ImportPipeline::handle_existing(const storage::Sou
     const auto& cp_row = cp.value();
     if (row.status == FileStatus::Stage1Processing) {
         return run_stage1(row, identity.value(), true, cp_row ? cp_row->stage1_offset : 0,
-                          cp_row ? cp_row->stage1_line : 0, cp_row ? cp_row->stage2_cursor : 0);
+                          cp_row ? cp_row->stage1_line : 0, cp_row ? cp_row->stage1_tlm_seq : 0);
     }
     // VALIDATED / PROCESSING_STAGE2: continue stage 2.
     auto stage2 = run_stage2(row);
@@ -425,8 +425,8 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
                 return result;
             }
             parser.seek_to(resume_offset);
-            // The last accepted frame sequence is persisted in the checkpoint's stage2_cursor
-            // column while the file is in stage 1.
+            // The last accepted frame sequence is persisted in the checkpoint's
+            // stage1_tlm_seq column while the file is in stage 1.
             if (resume_tlm_sequence > 0)
                 parser.set_last_sequence(static_cast<uint64_t>(resume_tlm_sequence));
         }
@@ -500,7 +500,9 @@ ImportPipeline::ProcessResult ImportPipeline::run_stage1(const storage::SourceFi
                 batch.push_back(std::move(staged));
             }
             ctx.cp.stage1_offset = parser.current_offset();
-            ctx.cp.stage2_cursor = parser.has_last_sequence() ? static_cast<int64_t>(parser.last_sequence()) : 0;
+            // TLM frame sequence lives in its own checkpoint column; stage2_cursor stays 0
+            // until stage 2 begins (it is the staging-row cursor there).
+            ctx.cp.stage1_tlm_seq = parser.has_last_sequence() ? static_cast<int64_t>(parser.last_sequence()) : 0;
             if (static_cast<int64_t>(batch.size()) >= batch_size) {
                 auto flushed = flush(false);
                 if (flushed == ProcessResult::Outcome::Interrupted) {
@@ -690,16 +692,19 @@ void ImportPipeline::init_stage2_context(const storage::SourceFileRow& row) {
 
 // Seeds the device watermark from durable history so cross-file lateness is detected:
 // a backfilled file older than the stream gets kLate flags and respects closed windows.
-void ImportPipeline::ensure_device_seeded(const std::string& device_id) {
+// A failed seed query is an error (not silently swallowed): late detection would be
+// disabled for the device, so the failure propagates and stage 2 retries on the next run.
+Result<void> ImportPipeline::ensure_device_seeded(const std::string& device_id) {
     if (seeded_devices_.count(device_id))
-        return;
-    seeded_devices_.insert(device_id);
+        return Result<void>::Ok();
     auto max_us = store_->max_event_time_for_device(device_id);
-    if (max_us.ok()) {
-        const auto& max_opt = max_us.value();
-        if (max_opt)
-            reorder_->seed_device(device_id, *max_opt);
-    }
+    if (!max_us.ok())
+        return Result<void>::Err(max_us.error());
+    seeded_devices_.insert(device_id);
+    const auto& max_opt = max_us.value();
+    if (max_opt.has_value())
+        reorder_->seed_device(device_id, *max_opt);
+    return Result<void>::Ok();
 }
 
 // Normalizes one staged record: calibration -> unit conversion -> validity range
@@ -810,7 +815,9 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
         for (const auto& staged : rows.value()) {
             if (staged.status != StagedStatus::Accepted)
                 continue;
-            ensure_device_seeded(staged.device_id);
+            auto seeded = ensure_device_seeded(staged.device_id);
+            if (!seeded.ok())
+                return Result<void>::Err(seeded.error());
             touched_devices.insert(staged.device_id);
 
             auto normalized = normalize_staged(staged);
@@ -919,12 +926,17 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
     // flag), commit the tail, then close every window this file touched. Window closing
     // recomputes from the samples table, so it is idempotent and crash-safe.
     std::vector<storage::SampleRow> tail_samples;
+    std::vector<processing::NormalizedSample> tail_late;
     for (const auto& device : seeded_devices_) {
         reorder_->flush_device(device, /*mark_forced=*/false);
         for (auto& s : *emitted_) {
             auto rc = process_emitted(row, s, false, tail_samples);
             if (!rc.ok())
                 return Result<void>::Err(rc.error());
+            // Tail late samples must receive the same correction treatment as the main
+            // loop (audit #5): collect and apply after the samples are durable.
+            if ((s.flags & sample_flags::kLate) != 0)
+                tail_late.push_back(s);
             gaps_->feed(s);
         }
         emitted_->clear();
@@ -948,6 +960,13 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
             return Result<void>::Err(rc.error());
         tail_samples.clear();
     }
+    // Corrections read the committed samples table, so apply after the tail insert.
+    for (const auto& s : tail_late) {
+        auto corrected = windows_->correct_for_sample(s);
+        if (!corrected.ok())
+            return Result<void>::Err(corrected.error());
+    }
+    tail_late.clear();
     for (const auto& device : seeded_devices_) {
         auto wm = reorder_->watermark(device);
         if (wm != INT64_MIN) {

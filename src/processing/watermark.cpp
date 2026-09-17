@@ -35,12 +35,12 @@ void ReorderBuffer::push(NormalizedSample sample) {
     buf.buffered_bytes += sample_bytes(entry.sample);
     buf.by_time[entry.sample.event_time_us].push_back(std::move(entry));
 
-    // Cap check: force-advance the watermark to max_seen, releasing everything buffered.
+    // Normal watermark drain first (audit #18): on-time samples are released without
+    // the forced flag; only the over-capacity remainder is force-flushed.
+    drain(buf, device_id, watermark, false);
     if (buf.buffered_records >= max_records_ || buf.buffered_bytes >= max_bytes_) {
         drain(buf, device_id, buf.max_seen, true);
-        return;
     }
-    drain(buf, device_id, watermark, false);
 }
 
 void ReorderBuffer::seed_device(const std::string& device, int64_t max_seen_us) {

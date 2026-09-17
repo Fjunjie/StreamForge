@@ -84,6 +84,7 @@ public:
     // Statement execution inside the open transaction.
     Result<void> exec(const std::string& sql);
     Result<Stmt> prepare(const std::string& sql);
+    [[nodiscard]] Db& db() const { return *db_; }
 
 private:
     Txn() = default;

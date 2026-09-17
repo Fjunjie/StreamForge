@@ -35,14 +35,16 @@ struct WindowStats {
 };
 
 // Recomputes one window from the durable samples (value stats use non-null,
-// non-device-error rows; counts include everything per requirement 7a).
-WindowStats compute_stats(storage::Store& store, const WindowAggregator::WindowKey& key, int64_t end_us,
-                          const MetricCfg* metric) {
+// non-device-error rows; counts include everything per requirement 7a). Errors are
+// propagated (audit #9/#10): a swallowed prepare/step failure would otherwise persist
+// an empty aggregate row and mark the window closed.
+Result<WindowStats> compute_stats(storage::Store& store, const WindowAggregator::WindowKey& key, int64_t end_us,
+                                  const MetricCfg* metric) {
     WindowStats stats;
     auto st = store.db().prepare("SELECT event_time_us, value, quality, flags FROM samples WHERE device_id=? AND"
                                  " metric_id=? AND event_time_us>=? AND event_time_us<? ORDER BY event_time_us");
     if (!st.ok())
-        return stats;
+        return Result<WindowStats>::Err(st.error());
     st.value().bind_text(1, key.device_id);
     st.value().bind_text(2, key.metric_id);
     st.value().bind_int64(3, key.start_us);
@@ -52,13 +54,17 @@ WindowStats compute_stats(storage::Store& store, const WindowAggregator::WindowK
     double mean = 0.0, m2 = 0.0;
     double kahan_c = 0.0;
     std::vector<double> values;
-    int64_t expected_capacity =
-        metric && metric->expected_period_us ? (end_us - key.start_us) / *metric->expected_period_us : 0;
+    // Guard against division by zero (audit #8, CWE-369): config validation rejects
+    // non-positive periods, but the runtime check keeps the query path safe.
+    int64_t expected_capacity = 0;
+    if (metric && metric->expected_period_us && *metric->expected_period_us > 0) {
+        expected_capacity = (end_us - key.start_us) / *metric->expected_period_us;
+    }
 
     for (;;) {
         auto step = st.value().step();
         if (!step.ok())
-            return stats;
+            return Result<WindowStats>::Err(step.error());
         if (step.value() != storage::Stmt::Step::Row)
             break;
         const int64_t t = st.value().column_int64(0);
@@ -129,11 +135,13 @@ WindowStats compute_stats(storage::Store& store, const WindowAggregator::WindowK
         int64_t missing = expected_capacity - stats.sample_count;
         stats.missing_count = missing > 0 ? missing : 0;
     }
-    return stats;
+    return Result<WindowStats>::Ok(stats);
 }
 
-Result<void> write_window(storage::Store& store, const WindowAggregator::WindowKey& key, int64_t end_us,
-                          int64_t version, const WindowStats& s, const MetricCfg* metric) {
+// Writes one aggregate row inside an already-open transaction (audit #11: the supersede
+// UPDATE and the corrected INSERT must commit atomically).
+Result<void> write_window(storage::Txn& txn, const WindowAggregator::WindowKey& key, int64_t end_us, int64_t version,
+                          const WindowStats& s, const MetricCfg* metric) {
     static const char* kSql =
         "INSERT INTO aggregates(device_id, metric_id, window_type, start_us, end_us, version,"
         " sample_count, valid_count, missing_count, bad_quality_count, synthetic_count,"
@@ -150,10 +158,7 @@ Result<void> write_window(storage::Store& store, const WindowAggregator::WindowK
         " last_value=excluded.last_value, last_time_us=excluded.last_time_us,"
         " p50=excluded.p50, p95=excluded.p95, p99=excluded.p99, superseded=0,"
         " created_at_us=excluded.created_at_us";
-    auto txn = storage::Txn::begin(store.db());
-    if (!txn.ok())
-        return Result<void>::Err(txn.error());
-    auto st = txn.value().prepare(kSql);
+    auto st = txn.prepare(kSql);
     if (!st.ok())
         return Result<void>::Err(st.error());
     int idx = 1;
@@ -193,11 +198,8 @@ Result<void> write_window(storage::Store& store, const WindowAggregator::WindowK
     st.value().bind_int64(idx++, now_unix_us());
     auto step = st.value().step();
     if (!step.ok() || step.value() != storage::Stmt::Step::Done) {
-        return Result<void>::Err(Error::make(ErrorCode::DbStep, "aggregate write failed: " + store.db().last_error()));
+        return Result<void>::Err(Error::make(ErrorCode::DbStep, "aggregate write failed: " + txn.db().last_error()));
     }
-    auto commit = txn.value().commit();
-    if (!commit.ok())
-        return Result<void>::Err(commit.error());
     return Result<void>::Ok();
 }
 
@@ -229,7 +231,16 @@ bool WindowAggregator::is_closed(const WindowKey& key) {
     if (!step.ok() || step.value() != storage::Stmt::Step::Row)
         return false;
     closed_.insert(key);
+    evict_closed_cache();
     return true;
+}
+
+// Audit #13: bounds the closed-window cache for long-lived processes. The set is a pure
+// lookup accelerator; after eviction is_closed() falls back to the database.
+void WindowAggregator::evict_closed_cache() {
+    constexpr size_t kClosedCacheMax = 100000;
+    if (closed_.size() > kClosedCacheMax)
+        closed_.clear();
 }
 
 void WindowAggregator::on_sample(const NormalizedSample& sample) {
@@ -262,7 +273,10 @@ Result<int64_t> WindowAggregator::next_version(const WindowKey& key) {
 
 Result<void> WindowAggregator::close_window(const WindowKey& key, int64_t end_us) {
     const MetricCfg* metric = cs_->metric(key.metric_id);
-    WindowStats stats = compute_stats(*store_, key, end_us, metric);
+    auto stats_rc = compute_stats(*store_, key, end_us, metric);
+    if (!stats_rc.ok())
+        return Result<void>::Err(stats_rc.error());
+    const WindowStats& stats = stats_rc.value();
 
     // Version selection: write version 1 unless it exists and was superseded by a
     // correction — then append the next free version (FR-AGG-003).
@@ -279,18 +293,30 @@ Result<void> WindowAggregator::close_window(const WindowKey& key, int64_t end_us
     if (!step.ok())
         return Result<void>::Err(step.error());
     closed_.insert(key);
-    if (step.value() != storage::Stmt::Step::Row) {
-        return write_window(*store_, key, end_us, 1, stats, metric);
+    evict_closed_cache();
+    int64_t version = 1;
+    if (step.value() == storage::Stmt::Step::Row) {
+        const int64_t v1_superseded = v1_exists.value().column_int64(0);
+        if (v1_superseded != 0) {
+            auto next = next_version(key);
+            if (!next.ok())
+                return Result<void>::Err(next.error());
+            version = next.value();
+        }
+        // v1 exists and not superseded: refresh version 1 in place (re-close after a
+        // crash or re-import).
     }
-    const int64_t v1_superseded = v1_exists.value().column_int64(0);
-    if (v1_superseded == 0) {
-        // Re-close of an open window (e.g. after a crash or re-import): refresh in place.
-        return write_window(*store_, key, end_us, 1, stats, metric);
-    }
-    auto version = next_version(key);
-    if (!version.ok())
-        return Result<void>::Err(version.error());
-    return write_window(*store_, key, end_us, version.value(), stats, metric);
+
+    auto txn = storage::Txn::begin(store_->db());
+    if (!txn.ok())
+        return Result<void>::Err(txn.error());
+    auto written = write_window(txn.value(), key, end_us, version, stats, metric);
+    if (!written.ok())
+        return Result<void>::Err(written.error());
+    auto commit = txn.value().commit();
+    if (!commit.ok())
+        return Result<void>::Err(commit.error());
+    return Result<void>::Ok();
 }
 
 Result<void> WindowAggregator::on_watermark(const std::string& device_id, int64_t watermark) {
@@ -346,27 +372,42 @@ Result<void> WindowAggregator::correct_for_sample(const NormalizedSample& sample
         if (step.value() != storage::Stmt::Step::Row) {
             continue; // window not closed yet: regular closing will include the sample
         }
-        // Mark existing versions superseded and append a corrected one.
-        auto sup = store_->db().prepare("UPDATE aggregates SET superseded=1 WHERE device_id=? AND metric_id=? AND"
-                                        " window_type=? AND start_us=?");
-        if (!sup.ok())
-            return Result<void>::Err(sup.error());
-        sup.value().bind_text(1, key.device_id);
-        sup.value().bind_text(2, key.metric_id);
-        sup.value().bind_text(3, window_type_text(seconds));
-        sup.value().bind_int64(4, key.start_us);
-        auto sup_step = sup.value().step();
-        if (!sup_step.ok() || sup_step.value() != storage::Stmt::Step::Done) {
-            return Result<void>::Err(Error::make(ErrorCode::DbStep, "supersede failed"));
+        // Audit #11: supersede + corrected INSERT commit atomically — a crash in between
+        // must never leave a window with all versions superseded and no valid one.
+        auto txn = storage::Txn::begin(store_->db());
+        if (!txn.ok())
+            return Result<void>::Err(txn.error());
+        {
+            auto sup = txn.value().prepare("UPDATE aggregates SET superseded=1 WHERE device_id=? AND metric_id=? AND"
+                                           " window_type=? AND start_us=?");
+            if (!sup.ok())
+                return Result<void>::Err(sup.error());
+            sup.value().bind_text(1, key.device_id);
+            sup.value().bind_text(2, key.metric_id);
+            sup.value().bind_text(3, window_type_text(seconds));
+            sup.value().bind_int64(4, key.start_us);
+            auto sup_step = sup.value().step();
+            if (!sup_step.ok() || sup_step.value() != storage::Stmt::Step::Done) {
+                return Result<void>::Err(Error::make(ErrorCode::DbStep, "supersede failed"));
+            }
         }
         const MetricCfg* metric = cs_->metric(key.metric_id);
-        WindowStats stats = compute_stats(*store_, key, end_us, metric);
+        auto stats_rc = compute_stats(*store_, key, end_us, metric);
+        if (!stats_rc.ok()) {
+            txn.value().rollback();
+            return Result<void>::Err(stats_rc.error());
+        }
         auto version = next_version(key);
-        if (!version.ok())
+        if (!version.ok()) {
+            txn.value().rollback();
             return Result<void>::Err(version.error());
-        auto rc = write_window(*store_, key, end_us, version.value(), stats, metric);
+        }
+        auto rc = write_window(txn.value(), key, end_us, version.value(), stats_rc.value(), metric);
         if (!rc.ok())
             return rc;
+        auto commit = txn.value().commit();
+        if (!commit.ok())
+            return Result<void>::Err(commit.error());
         open_windows_[sample.device_id].erase(key);
     }
     return Result<void>::Ok();

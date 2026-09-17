@@ -41,16 +41,16 @@ typedef enum tlm_status {
     TLM_ERR_INVALID_ARGUMENT = 14   /* NULL or otherwise invalid arguments */
 } tlm_status;
 
-#define TLM_FRAME_HEADER_SIZE 16u
-#define TLM_FILE_HEADER_SIZE 24u
-#define TLM_MAX_PAYLOAD (4u * 1024u * 1024u)
-#define TLM_MAX_TAGS 16u
-#define TLM_TAG_KEY_MAX 128u
-#define TLM_TAG_VALUE_MAX 128u
-#define TLM_ID_MAX 64u
-#define TLM_UNIT_MAX 32u
-#define TLM_MAX_TLV_COUNT 256u
-#define TLM_MAX_TLV_VALUE 4096u
+#define TLM_FRAME_HEADER_SIZE ((size_t)16)
+#define TLM_FILE_HEADER_SIZE ((size_t)24)
+#define TLM_MAX_PAYLOAD ((size_t)4 * 1024 * 1024)
+#define TLM_MAX_TAGS ((size_t)16)
+#define TLM_TAG_KEY_MAX ((size_t)128)
+#define TLM_TAG_VALUE_MAX ((size_t)128)
+#define TLM_ID_MAX ((size_t)64)
+#define TLM_UNIT_MAX ((size_t)32)
+#define TLM_MAX_TLV_COUNT ((size_t)256)
+#define TLM_MAX_TLV_VALUE ((size_t)4096)
 
 /* Frame types. */
 #define TLM_FRAME_DATA 1u
@@ -112,11 +112,16 @@ typedef struct tlm_record {
 tlm_status tlm_decode_file_header(const uint8_t* buf, size_t len, tlm_file_header* out);
 
 /* Parses one frame starting at buf[0].
- * On TLM_OK: *consumed holds the total frame length; *info is filled; for data frames
+ * On success: *consumed holds the total frame length; *info is filled; for data frames
  * *record is filled. Unknown frame types (not 1/2/3) parse their framing but leave the
  * record untouched. Sequence state is advanced only on accepted frames; a regression
  * returns TLM_ERR_SEQUENCE_REGRESSION with *consumed set so the caller can skip the
- * offending frame and continue with the next one. */
+ * offending frame and continue with the next one.
+ * Contract: once the 16-byte frame header is decoded and the full frame is present in
+ * the buffer, *consumed and *info are set on EVERY outcome — including bad flags,
+ * payload-too-large, CRC mismatch, sequence regression and TLV errors — so a streaming
+ * caller can always skip the frame and make progress. Only BAD_SYNC, TRUNCATED and
+ * INVALID_ARGUMENT leave *consumed untouched (there is no complete frame to skip). */
 tlm_status tlm_parse_frame(const uint8_t* buf, size_t len, tlm_parser_state* st,
                            tlm_frame_info* info, size_t* consumed, tlm_record* record);
 

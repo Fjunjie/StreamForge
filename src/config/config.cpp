@@ -707,6 +707,7 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
     if (const YAML::Node cs = root["calibrations"]) {
         if (cs.IsSequence()) {
             int index = 0;
+            std::set<std::string> calibration_keys;
             for (const auto& item : cs) {
                 std::string where = "calibrations[" + std::to_string(index) + "]";
                 ++index;
@@ -714,6 +715,15 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                 DeviceCalibration dc;
                 dc.device_id = require_string(item, "device", where, errors);
                 dc.metric_id = require_string(item, "metric", where, errors);
+                // Audit #16: duplicate (device, metric) calibration entries would silently
+                // shadow each other — reject them like duplicate metric ids.
+                std::string calib_key = dc.device_id + "/" + dc.metric_id;
+                if (!calib_key.empty() && dc.metric_id != "" && !calibration_keys.insert(calib_key).second) {
+                    errors.push_back(Error::make(ErrorCode::ConfigValidation,
+                                                 "duplicate calibration entry for device '" + dc.device_id +
+                                                     "' and metric '" + dc.metric_id + "'")
+                                         .ctx("location", where));
+                }
                 dc.calibration.reject_unmatched = optional_string(item, "reject_unmatched", "false") == "true";
                 if (const YAML::Node segs = item["segments"]) {
                     if (!segs.IsSequence() || segs.size() == 0) {

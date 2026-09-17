@@ -71,6 +71,9 @@ private:
     // True when the key is known closed (memory cache or the aggregates table). Closed
     // windows only change via correct_for_sample.
     bool is_closed(const WindowKey& key);
+    // Audit #13: bounds the closed-window cache — it is a lookup accelerator only;
+    // is_closed() falls back to the database after eviction.
+    void evict_closed_cache();
     Result<void> close_window(const WindowKey& key, int64_t end_us);
     Result<int64_t> next_version(const WindowKey& key);
 

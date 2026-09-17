@@ -133,11 +133,11 @@ TEST_CASE("window boundaries align to UTC epoch multiples", "[windows]") {
     auto a = Agg::make(dir.path, {60});
     // Samples straddling the 10:01:00 boundary land in two windows.
     std::vector<NormalizedSample> samples{
-        make("dev-01", "temp", 601 * 1'000'000'000LL, 1.0), // 10:01:00 window
-        make("dev-01", "temp", 599 * 1'000'000'000LL, 2.0), // 09:59:00 window? 599s epoch
+        make("dev-01", "temp", 601LL * 1'000'000LL, 1.0), // 10:01:00 window
+        make("dev-01", "temp", 599LL * 1'000'000LL, 2.0), // 09:59:00 window? 599s epoch
     };
     // Epoch seconds 599 and 601 with 60s windows: starts 540s and 600s.
-    a.run(samples, 700LL * 1'000'000'000LL);
+    a.run(samples, 700LL * 1'000'000LL);
     auto count =
         a.store->db().prepare("SELECT COUNT(*) FROM aggregates WHERE device_id='dev-01' AND window_type='60s'");
     REQUIRE(count.ok());
@@ -161,7 +161,22 @@ TEST_CASE("late samples with correction disabled keep closed windows untouched",
     REQUIRE_FALSE(before.is_null());
     CHECK(before["sample_count"] == 5);
 
-    // A late sample for the closed window: stored, registered late, correction disabled.
+    // A late sample for the closed window: stored (the pipeline commits it before
+    // correction), registered late, correction disabled.
+    std::vector<storage::SampleRow> rows;
+    storage::SampleRow r;
+    r.sample_uuid = uuid_v4();
+    r.device_id = "dev-01";
+    r.metric_id = "temp";
+    r.event_time_us = 120LL * 1'000'000LL;
+    r.ingest_time_us = 120LL * 1'000'000LL;
+    r.value = 9.0;
+    r.quality = 0;
+    r.flags = sample_flags::kLate;
+    r.config_version = 1;
+    rows.push_back(r);
+    REQUIRE(a.store->insert_samples(rows).ok());
+
     NormalizedSample late = make("dev-01", "temp", 120LL * 1'000'000LL, 9.0);
     late.flags |= sample_flags::kLate;
     a.windows->on_sample(late);

@@ -10,11 +10,11 @@ TEST_CASE("migrations apply once and are idempotent", "[storage]") {
     sf_test::TempDir dir;
     auto store = Store::open(dir.path + "/t.db");
     REQUIRE(store.ok());
-    CHECK(store.value()->schema_version().value() == 3);
+    CHECK(store.value()->schema_version().value() == 4);
 
     auto again = Store::open(dir.path + "/t.db");
     REQUIRE(again.ok());
-    CHECK(again.value()->schema_version().value() == 3);
+    CHECK(again.value()->schema_version().value() == 4);
 }
 
 TEST_CASE("wal mode and foreign keys enabled", "[storage]") {

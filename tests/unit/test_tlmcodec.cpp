@@ -268,9 +268,19 @@ TEST_CASE("tlm payload crc, truncation, size limit and sync", "[tlm]") {
         CHECK(tlm_parse_frame(broken.data(), broken.size(), &st, &info, &consumed, nullptr) == TLM_ERR_BAD_FLAGS);
     }
     SECTION("payload size beyond limit") {
+        // Header claims > 4 MiB but the body is not in the buffer: TRUNCATED wins over
+        // PAYLOAD_TOO_LARGE because there is no complete frame to skip past.
         std::vector<uint8_t> huge(16);
         tlm_write_frame_header(huge.data(), 1, 0, TLM_MAX_PAYLOAD + 1, 1);
-        CHECK(tlm_parse_frame(huge.data(), huge.size(), &st, &info, &consumed, nullptr) == TLM_ERR_PAYLOAD_TOO_LARGE);
+        CHECK(tlm_parse_frame(huge.data(), huge.size(), &st, &info, &consumed, nullptr) == TLM_ERR_TRUNCATED);
+        // With the full (oversized) frame buffered, the codec reports PAYLOAD_TOO_LARGE
+        // and sets consumed so the caller can skip the frame.
+        std::vector<uint8_t> full(TLM_FRAME_HEADER_SIZE + TLM_MAX_PAYLOAD + 4 + 1);
+        tlm_write_frame_header(full.data(), 1, 0, TLM_MAX_PAYLOAD + 1, 1);
+        tlm_write_u32(full.data() + TLM_FRAME_HEADER_SIZE + TLM_MAX_PAYLOAD + 1,
+                      tlm_crc32(full.data() + TLM_FRAME_HEADER_SIZE, TLM_MAX_PAYLOAD + 1));
+        CHECK(tlm_parse_frame(full.data(), full.size(), &st, &info, &consumed, nullptr) == TLM_ERR_PAYLOAD_TOO_LARGE);
+        CHECK(consumed == full.size());
     }
     SECTION("resync finds the next frame after garbage") {
         std::vector<uint8_t> stream;

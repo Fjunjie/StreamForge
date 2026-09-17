@@ -434,10 +434,11 @@ Result<std::map<std::string, int64_t>> Store::file_status_counts() {
 Result<void> Store::upsert_checkpoint(const std::string& file_id, const CheckpointRow& cp) {
     std::lock_guard<std::mutex> lock(mu_);
     auto st = db_.prepare("INSERT INTO checkpoints(file_id, stage, stage1_offset, stage1_line, stage2_cursor,"
-                          " updated_at_us) VALUES(?, ?, ?, ?, ?, ?)"
+                          " stage1_tlm_seq, updated_at_us) VALUES(?, ?, ?, ?, ?, ?, ?)"
                           " ON CONFLICT(file_id) DO UPDATE SET stage=excluded.stage,"
                           " stage1_offset=excluded.stage1_offset, stage1_line=excluded.stage1_line,"
-                          " stage2_cursor=excluded.stage2_cursor, updated_at_us=excluded.updated_at_us");
+                          " stage2_cursor=excluded.stage2_cursor, stage1_tlm_seq=excluded.stage1_tlm_seq,"
+                          " updated_at_us=excluded.updated_at_us");
     if (!st.ok())
         return Result<void>::Err(st.error());
     st.value().bind_text(1, file_id);
@@ -445,7 +446,8 @@ Result<void> Store::upsert_checkpoint(const std::string& file_id, const Checkpoi
     st.value().bind_int64(3, cp.stage1_offset);
     st.value().bind_int64(4, cp.stage1_line);
     st.value().bind_int64(5, cp.stage2_cursor);
-    st.value().bind_int64(6, cp.updated_at_us);
+    st.value().bind_int64(6, cp.stage1_tlm_seq);
+    st.value().bind_int64(7, cp.updated_at_us);
     auto step = st.value().step();
     if (!step.ok() || step.value() != Stmt::Step::Done) {
         return Result<void>::Err(Error::make(ErrorCode::DbStep, "upsert checkpoint failed"));
@@ -455,8 +457,8 @@ Result<void> Store::upsert_checkpoint(const std::string& file_id, const Checkpoi
 
 Result<std::optional<CheckpointRow>> Store::get_checkpoint(const std::string& file_id) {
     std::lock_guard<std::mutex> lock(mu_);
-    auto st = db_.prepare("SELECT stage, stage1_offset, stage1_line, stage2_cursor, updated_at_us"
-                          " FROM checkpoints WHERE file_id = ?");
+    auto st = db_.prepare("SELECT stage, stage1_offset, stage1_line, stage2_cursor, stage1_tlm_seq,"
+                          " updated_at_us FROM checkpoints WHERE file_id = ?");
     if (!st.ok())
         return Result<std::optional<CheckpointRow>>::Err(st.error());
     st.value().bind_text(1, file_id);
@@ -471,7 +473,8 @@ Result<std::optional<CheckpointRow>> Store::get_checkpoint(const std::string& fi
     cp.stage1_offset = st.value().column_int64(1);
     cp.stage1_line = st.value().column_int64(2);
     cp.stage2_cursor = st.value().column_int64(3);
-    cp.updated_at_us = st.value().column_int64(4);
+    cp.stage1_tlm_seq = st.value().column_int64(4);
+    cp.updated_at_us = st.value().column_int64(5);
     return Result<std::optional<CheckpointRow>>::Ok(cp);
 }
 
@@ -535,10 +538,11 @@ Result<void> Store::stage_batch(const std::string& file_id, const std::vector<St
         }
     }
     static const char* kCpSql = "INSERT INTO checkpoints(file_id, stage, stage1_offset, stage1_line, stage2_cursor,"
-                                " updated_at_us) VALUES(?, ?, ?, ?, ?, ?)"
+                                " stage1_tlm_seq, updated_at_us) VALUES(?, ?, ?, ?, ?, ?, ?)"
                                 " ON CONFLICT(file_id) DO UPDATE SET stage=excluded.stage,"
                                 " stage1_offset=excluded.stage1_offset, stage1_line=excluded.stage1_line,"
-                                " stage2_cursor=excluded.stage2_cursor, updated_at_us=excluded.updated_at_us";
+                                " stage2_cursor=excluded.stage2_cursor, stage1_tlm_seq=excluded.stage1_tlm_seq,"
+                                " updated_at_us=excluded.updated_at_us";
     auto cp_st = txn.value().prepare(kCpSql);
     if (!cp_st.ok())
         return Result<void>::Err(cp_st.error());
@@ -547,7 +551,8 @@ Result<void> Store::stage_batch(const std::string& file_id, const std::vector<St
     cp_st.value().bind_int64(3, cp.stage1_offset);
     cp_st.value().bind_int64(4, cp.stage1_line);
     cp_st.value().bind_int64(5, cp.stage2_cursor);
-    cp_st.value().bind_int64(6, now_unix_us());
+    cp_st.value().bind_int64(6, cp.stage1_tlm_seq);
+    cp_st.value().bind_int64(7, now_unix_us());
     auto cp_step = cp_st.value().step();
     if (!cp_step.ok() || cp_step.value() != Stmt::Step::Done) {
         return Result<void>::Err(Error::make(ErrorCode::DbStep, "checkpoint upsert failed"));

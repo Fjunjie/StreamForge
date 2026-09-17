@@ -56,7 +56,8 @@ private:
 
     bool has_last_sequence_ = false;
     uint64_t last_sequence_ = 0;
-    bool resynced_ = false; // set after a resync until a clean frame is decoded
+    bool resynced_ = false; // set after a resync; stays set for the rest of the stream
+                            // (conservative: records after the resync point are quality-marked)
     bool header_checked_ = false;
     tlm_frame_info info_{}; // frame metadata of the frame being decoded
 };

@@ -291,13 +291,11 @@ tlm_status tlm_parse_frame(const uint8_t* buf, size_t len, tlm_parser_state* st,
     uint32_t payload_size = rd_u32(buf + 4);
     uint64_t sequence = rd_u64(buf + 8);
 
-    if ((fflags & ~TLM_FRAME_FLAG_COMPRESSED) != 0u) return TLM_ERR_BAD_FLAGS;
-    if (payload_size > TLM_MAX_PAYLOAD) return TLM_ERR_PAYLOAD_TOO_LARGE;
     if (len - TLM_FRAME_HEADER_SIZE < (size_t)payload_size + 4u) return TLM_ERR_TRUNCATED;
 
     /* The frame framing is now fully determined: report the consumed length and frame
-     * info on EVERY outcome from here on (CRC/sequence/TLV/compression errors included)
-     * so the caller can always skip past the frame and make progress. */
+     * info on EVERY outcome from here on (flags/sequence/CRC/TLV/compression errors
+     * included) so the caller can always skip past the frame and make progress. */
     *consumed = TLM_FRAME_HEADER_SIZE + (size_t)payload_size + 4u;
     info->frame_type = ftype;
     info->flags = fflags;
@@ -305,6 +303,9 @@ tlm_status tlm_parse_frame(const uint8_t* buf, size_t len, tlm_parser_state* st,
     info->sequence = sequence;
     info->total_len = *consumed;
     info->suspicious = st->suspicious;
+
+    if ((fflags & ~TLM_FRAME_FLAG_COMPRESSED) != 0u) return TLM_ERR_BAD_FLAGS;
+    if (payload_size > TLM_MAX_PAYLOAD) return TLM_ERR_PAYLOAD_TOO_LARGE;
 
     const uint8_t* payload = buf + TLM_FRAME_HEADER_SIZE;
     uint32_t stored_crc = rd_u32(payload + payload_size);
