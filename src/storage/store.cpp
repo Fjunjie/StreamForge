@@ -179,6 +179,27 @@ Result<void> Store::sync_catalog(const ConfigSnapshot& cs) {
         }
     }
 
+    // Derived metrics live in the same catalog: derived samples share the samples data
+    // model (FR-DER-002), whose foreign keys require a metrics row.
+    for (const auto& dm : cs.cfg.derived_metrics) {
+        static const char* kSql = "INSERT INTO metrics(id, canonical_unit, valid_min, valid_max, expected_period_us,"
+                                  " jitter_us, max_gap_us, interpolation, config_version, created_at_us)"
+                                  " VALUES(?, ?, NULL, NULL, NULL, NULL, NULL, 'none', ?, ?)"
+                                  " ON CONFLICT(id) DO UPDATE SET canonical_unit=excluded.canonical_unit,"
+                                  " config_version=excluded.config_version";
+        auto st = txn.value().prepare(kSql);
+        if (!st.ok())
+            return Result<void>::Err(st.error());
+        st.value().bind_text(1, dm.id);
+        st.value().bind_text(2, dm.unit);
+        st.value().bind_int64(3, version);
+        st.value().bind_int64(4, now);
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Done) {
+            return Result<void>::Err(Error::make(ErrorCode::DbStep, "upsert derived metric failed"));
+        }
+    }
+
     // device_metric pairs: rebuild from configuration.
     {
         auto del = txn.value().exec("DELETE FROM device_metrics");
@@ -190,6 +211,8 @@ Result<void> Store::sync_catalog(const ConfigSnapshot& cs) {
             if (dev.metrics.empty()) {
                 for (const auto& m : cs.cfg.metrics)
                     metric_ids.push_back(m.id);
+                for (const auto& dm : cs.cfg.derived_metrics)
+                    metric_ids.push_back(dm.id);
             } else {
                 metric_ids = dev.metrics;
             }

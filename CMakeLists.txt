@@ -111,6 +111,7 @@ add_library(sf_core STATIC
     src/core/units.cpp
     src/core/uuid.cpp
     src/core/log.cpp
+    src/core/metrics.cpp
     src/core/fs_util.cpp)
 target_include_directories(sf_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(sf_core
@@ -152,7 +153,9 @@ add_library(sf_processing STATIC
     src/processing/dedup.cpp
     src/processing/watermark.cpp
     src/processing/missing.cpp
-    src/processing/windows.cpp)
+    src/processing/windows.cpp
+    src/processing/derived.cpp
+    src/processing/sample_buffer.cpp)
 target_link_libraries(sf_processing PUBLIC sf_config sf_storage nlohmann_json::nlohmann_json)
 
 add_library(sf_rules STATIC
@@ -181,6 +184,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/support/test_env.cpp
         tests/unit/test_time.cpp
         tests/unit/test_error.cpp
+        tests/unit/test_metrics.cpp
         tests/unit/test_expression.cpp
         tests/unit/test_bounded_queue.cpp
         tests/unit/test_log.cpp
@@ -196,6 +200,8 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_missing_interp.cpp
         tests/unit/test_windows.cpp
         tests/unit/test_rolling.cpp
+        tests/unit/test_derived.cpp
+        tests/unit/test_sample_buffer.cpp
         tests/unit/test_validation.cpp
         tests/unit/test_config.cpp
         tests/unit/test_storage.cpp
