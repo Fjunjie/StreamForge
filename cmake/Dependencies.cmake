@@ -53,4 +53,12 @@ FetchContent_Declare(date
     GIT_REPOSITORY https://github.com/HowardHinnant/date.git
     GIT_TAG        v3.0.1)
 
-FetchContent_MakeAvailable(yaml-cpp nlohmann_json spdlog Catch2 date)
+# cpp-httplib: header-only HTTP server/client for the M3 API. Used only behind the
+# streamforge::api facade; business code never includes httplib.h (requirement 10.4).
+set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.15.3)
+
+FetchContent_MakeAvailable(yaml-cpp nlohmann_json spdlog Catch2 date httplib)

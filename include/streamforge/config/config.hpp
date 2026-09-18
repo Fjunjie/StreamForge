@@ -80,6 +80,8 @@ struct RuleCfg {
 struct ServerConfig {
     std::string bind = "127.0.0.1";
     int port = 8080;
+    std::string admin_token_file; // FR-API-004: file holding the admin bearer token (0600)
+    int64_t max_query_range_us = 24LL * 3600 * 1000000; // FR-API-003: max sample/aggregate query span
 };
 
 struct DirectoriesConfig {

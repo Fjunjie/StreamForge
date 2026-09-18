@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,6 +65,10 @@ struct RuleEvalResult {
 // current state instead of triggering or recovering.
 Result<RuleEvalResult> evaluate_rule(const CompiledRule& rule, const expr::EvalContext& ctx);
 
+// Largest duration literal used by window functions (AVG/DELTA/RATE) across the rules,
+// bounding the SampleBuffer retention the host must keep; 0 when none is used.
+int64_t max_rule_window_us(const std::vector<CompiledRule>& rules);
+
 // Manages the state machine transitions and incident lifecycle for all (rule, device)
 // pairs. The rule_states and incidents tables are the source of truth; in-memory
 // state is lazily restored from them so a restart never overwrites persisted state.
@@ -85,6 +90,14 @@ public:
     Result<void> evaluate_device(const std::string& device_id, int64_t eval_time_us,
                                  const std::map<std::string, double>& metric_values,
                                  const std::map<std::string, std::string>& metric_units);
+
+    // Registers the window-function provider backing AVG/DELTA/RATE in rule
+    // expressions (the host binds it to the rolling SampleBuffer). Without a
+    // provider those functions report an evaluation error and skip the rule.
+    void set_window_provider(
+        std::function<std::optional<double>(const std::string& device, const std::string& metric, int64_t duration_us,
+                                            const std::string& func)>
+            provider);
 
     // Close all open incidents for a rule in one transaction.
     Result<void> close_rule_incidents(const std::string& rule_id, const std::string& reason);
@@ -131,6 +144,9 @@ private:
     std::map<std::pair<std::string, std::string>, DeviceState> states_; // (rule_id, device_id)
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> device_tags_;
     uint64_t config_version_ = 0;
+    std::function<std::optional<double>(const std::string& device, const std::string& metric, int64_t duration_us,
+                                        const std::string& func)>
+        window_provider_;
 };
 
 } // namespace rules

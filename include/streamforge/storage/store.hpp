@@ -120,6 +120,14 @@ struct SampleQuery {
     bool exclude_synthetic = false;
 };
 
+// Cursor-paginated sample page backing GET /api/v1/samples: rows ordered by
+// (event_time_us, id) with id > after_id; has_more signals the next page.
+struct SamplePage {
+    std::vector<SampleRow> rows;
+    int64_t last_id = 0;
+    bool has_more = false;
+};
+
 struct IncidentRow {
     std::string uuid;
     std::string rule_id;
@@ -133,6 +141,61 @@ struct IncidentRow {
     int64_t reopen_count = 0;
     std::string acked_by;
     std::string ack_comment;
+};
+
+struct IncidentFilter {
+    std::string state;    // empty = any
+    std::string severity; // empty = any
+    std::string device_id;
+    std::string rule_id;
+    int64_t from_us = 0; // 0 = unbounded
+    int64_t to_us = 0;
+    int64_t limit = 100;
+};
+
+struct DeviceRow {
+    std::string id;
+    std::string timezone;
+    std::vector<std::pair<std::string, std::string>> tags;
+    bool enabled = true;
+    int64_t config_version = 0;
+};
+
+struct AggregateRow {
+    std::string device_id;
+    std::string metric_id;
+    std::string window_type;
+    int64_t start_us = 0;
+    int64_t end_us = 0;
+    int64_t version = 0;
+    int64_t sample_count = 0;
+    int64_t valid_count = 0;
+    int64_t missing_count = 0;
+    int64_t bad_quality_count = 0;
+    int64_t synthetic_count = 0;
+    std::optional<double> min_value;
+    std::optional<double> max_value;
+    std::optional<double> avg_value;
+    std::optional<double> sum_value;
+    std::optional<double> stddev;
+    std::optional<double> first_value;
+    std::optional<int64_t> first_time_us;
+    std::optional<double> last_value;
+    std::optional<int64_t> last_time_us;
+    std::optional<double> p50;
+    std::optional<double> p95;
+    std::optional<double> p99;
+    bool superseded = false;
+    int64_t created_at_us = 0;
+};
+
+struct TimelineEntry {
+    int64_t at_us = 0;
+    std::string from_state;
+    std::string to_state;
+    std::string reason;
+    std::string actor;
+    std::string details_json;
 };
 
 // Facade over SQLite: catalog sync, file lifecycle, staging, samples, incidents and audit.
@@ -202,13 +265,35 @@ public:
                                   int64_t to_us);
     Result<int64_t> count_all_samples();
     Result<std::vector<SampleRow>> query_samples(const SampleQuery& q);
+    Result<SamplePage> query_samples_page(const std::string& device_id, const std::string& metric_id, int64_t from_us,
+                                          int64_t to_us, int64_t after_id, int64_t limit);
 
     // --- incidents (query and ack only until M3) ---
     Result<std::vector<IncidentRow>> query_incidents(const std::string& state, const std::string& severity,
                                                      int64_t limit);
+    // Filtered incident query backing GET /api/v1/incidents.
+    Result<std::vector<IncidentRow>> query_incidents_filtered(const IncidentFilter& filter);
+    Result<std::optional<IncidentRow>> get_incident(const std::string& incident_uuid);
     Result<std::vector<IncidentRow>> incident_history(const std::string& incident_uuid);
+    // State-change timeline of one incident (FR-RULE-003).
+    Result<std::vector<TimelineEntry>> incident_timeline(const std::string& incident_uuid);
     Result<bool> ack_incident(const std::string& incident_uuid, const std::string& by, const std::string& comment,
                               int64_t at_us);
+    Result<int64_t> count_incidents(const std::string& state);
+
+    // --- catalog and aggregates (API query backing, M4) ---
+    Result<std::vector<DeviceRow>> list_devices();
+    // Latest-version window aggregates in [from_us, to_us); empty device/metric/window_type = any.
+    Result<std::vector<AggregateRow>> query_aggregates(const std::string& device_id, const std::string& metric_id,
+                                                       const std::string& window_type, int64_t from_us, int64_t to_us,
+                                                       int64_t limit);
+
+    // --- data retention (FR-DB-004, M4) ---
+    // Batched deletes for samples, aggregates, closed incidents (history cascades) and
+    // audit rows older than the configured retention. Open incidents, rule states and
+    // checkpoints are never touched. Each transaction deletes at most batch_rows rows.
+    // Returns the total number of deleted rows.
+    Result<int64_t> purge_retention(const RetentionConfig& retention, int64_t batch_rows);
 
     // --- operations / audit ---
     Result<void> audit(const std::string& op, const std::string& actor, const std::string& target,

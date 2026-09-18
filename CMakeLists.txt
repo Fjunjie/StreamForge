@@ -165,10 +165,20 @@ sf_add_warnings(sf_rules)
 sf_add_warnings(sf_processing)
 
 # ---------------------------------------------------------------------------
+# API layer (M3/M4): HTTP facade, hot-reload runtime, import jobs
+# ---------------------------------------------------------------------------
+add_library(sf_api STATIC
+    src/api/api.cpp
+    src/api/runtime.cpp)
+target_link_libraries(sf_api
+    PUBLIC sf_config sf_rules sf_storage sf_ingest PRIVATE httplib::httplib)
+sf_add_warnings(sf_api)
+
+# ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(streamforge-server src/server_main.cpp)
-target_link_libraries(streamforge-server PRIVATE sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
+target_link_libraries(streamforge-server PRIVATE sf_api sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
 sf_add_warnings(streamforge-server)
 
 add_executable(streamforgectl src/ctl_main.cpp)
@@ -202,6 +212,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_rolling.cpp
         tests/unit/test_derived.cpp
         tests/unit/test_sample_buffer.cpp
+        tests/unit/test_api.cpp
         tests/unit/test_validation.cpp
         tests/unit/test_config.cpp
         tests/unit/test_storage.cpp
@@ -216,7 +227,7 @@ if(STREAMFORGE_BUILD_TESTS)
         STREAMFORGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         STREAMFORGE_CTL_BIN="$<TARGET_FILE:streamforgectl>")
     target_link_libraries(streamforge-tests PRIVATE
-        Catch2::Catch2WithMain sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
+        Catch2::Catch2WithMain sf_api sf_ingest sf_processing sf_rules sf_storage sf_config sf_core httplib::httplib)
     sf_add_warnings(streamforge-tests)
     add_test(NAME streamforge-all COMMAND streamforge-tests)
 endif()
