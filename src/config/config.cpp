@@ -798,7 +798,7 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
                 std::string where = "rules[" + std::to_string(index) + "]";
                 ++index;
                 check_keys(item,
-                           {"id", "type", "severity", "devices", "condition", "recovery", "duration", "cooldown",
+                           {"id", "type", "severity", "devices", "trigger", "recovery", "duration", "cooldown",
                             "merge_interval"},
                            where, warnings);
                 RuleCfg r;

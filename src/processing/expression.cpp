@@ -2,13 +2,71 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
-#include <set>
-
-#include "streamforge/core/units.hpp"
+#include <cstdint>
+#include <cstdlib>
 
 namespace streamforge {
 namespace expr {
+
+namespace {
+
+[[noreturn]] Error parse_error(const std::string& msg, size_t pos) {
+    throw Error::make(ErrorCode::ConfigValidation, "expression parse error: " + msg).ctx("pos", std::to_string(pos));
+}
+
+std::string to_lower(const std::string& s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
+    return out;
+}
+
+// Duration literals are integer + unit (ms|s|m|h|d), resolved to microseconds.
+// Returns -1 when the value overflows int64 (rejected at parse time).
+int64_t parse_duration(const std::string& text) {
+    size_t i = 0;
+    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
+        ++i;
+    if (i == 0 || i == text.size())
+        return 0;
+    int64_t num = 0;
+    for (size_t k = 0; k < i; ++k) {
+        int digit = text[k] - '0';
+        if (num > (INT64_MAX - digit) / 10)
+            return -1;
+        num = num * 10 + digit;
+    }
+    std::string unit = to_lower(text.substr(i));
+    int64_t factor = 0;
+    if (unit == "ms")
+        factor = 1000;
+    else if (unit == "s")
+        factor = 1000000;
+    else if (unit == "m")
+        factor = 60LL * 1000000;
+    else if (unit == "h")
+        factor = 3600LL * 1000000;
+    else if (unit == "d")
+        factor = 24LL * 3600 * 1000000;
+    else
+        return 0; // unknown unit (not reached: is_duration_literal gates callers)
+    if (factor != 0 && num > INT64_MAX / factor)
+        return -1;
+    return num * factor;
+}
+
+bool is_duration_literal(const std::string& text) {
+    size_t i = 0;
+    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
+        ++i;
+    if (i == 0 || i == text.size())
+        return false;
+    std::string unit = to_lower(text.substr(i));
+    return unit == "ms" || unit == "s" || unit == "m" || unit == "h" || unit == "d";
+}
+
+} // namespace
 
 // -----------------------------------------------------------------------
 // Tokenizer
@@ -42,16 +100,38 @@ public:
             size_t start = pos_;
             while (pos_ < src_.size() && (std::isdigit(static_cast<unsigned char>(src_[pos_])) || src_[pos_] == '.'))
                 ++pos_;
-            // Duration suffix: number immediately followed by letter(s)
-            if (pos_ < src_.size() && std::isalpha(static_cast<unsigned char>(src_[pos_]))) {
+            // Scientific notation: 1e10, 1.5E-3. An 'e' not followed by digits belongs
+            // to a duration suffix or identifier instead (restored below).
+            bool has_exponent = false;
+            if (pos_ < src_.size() && (src_[pos_] == 'e' || src_[pos_] == 'E')) {
+                size_t save = pos_;
+                ++pos_;
+                if (pos_ < src_.size() && (src_[pos_] == '+' || src_[pos_] == '-'))
+                    ++pos_;
+                if (pos_ < src_.size() && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                    while (pos_ < src_.size() && std::isdigit(static_cast<unsigned char>(src_[pos_])))
+                        ++pos_;
+                    has_exponent = true;
+                } else {
+                    pos_ = save;
+                }
+            }
+            t.text = src_.substr(start, pos_ - start);
+            // Duration suffix: number immediately followed by letter(s), e.g. 5m, 30s.
+            if (!has_exponent && pos_ < src_.size() && std::isalpha(static_cast<unsigned char>(src_[pos_]))) {
                 while (pos_ < src_.size() && std::isalpha(static_cast<unsigned char>(src_[pos_])))
                     ++pos_;
                 t.kind = Tok::Ident; // duration literal like "5m" — parsed as ident
                 t.text = src_.substr(start, pos_ - start);
                 return t;
             }
-            t.text = src_.substr(start, pos_ - start);
-            t.num = std::strtod(t.text.c_str(), nullptr);
+            errno = 0;
+            char* end = nullptr;
+            t.num = std::strtod(t.text.c_str(), &end);
+            if (end != t.text.c_str() + t.text.size())
+                parse_error("invalid number literal '" + t.text + "'", start);
+            if (errno == ERANGE)
+                parse_error("number literal out of range '" + t.text + "'", start);
             return t;
         }
 
@@ -66,14 +146,15 @@ public:
         }
 
         if (c == '\'') {
-            t.kind = Tok::String;
             ++pos_; // skip opening quote
             size_t start = pos_;
             while (pos_ < src_.size() && src_[pos_] != '\'')
                 ++pos_;
+            if (pos_ >= src_.size())
+                parse_error("unterminated string literal", start - 1);
+            t.kind = Tok::String;
             t.text = src_.substr(start, pos_ - start);
-            if (pos_ < src_.size())
-                ++pos_; // skip closing quote
+            ++pos_; // skip closing quote
             return t;
         }
 
@@ -119,18 +200,11 @@ public:
             t.kind = Tok::Comma;
             ++pos_;
             return t;
-        default: {
-            t.kind = Tok::End; // unknown character: signal end (parse error will be raised)
-            return t;
+        default:
+            // Unknown characters must fail loudly: silently ending the token stream
+            // would accept truncated expressions (e.g. "a && b" parsed as "a").
+            parse_error(std::string("unexpected character '") + c + "'", pos_);
         }
-        }
-    }
-
-    Token peek() {
-        size_t save = pos_;
-        Token t = next();
-        pos_ = save;
-        return t;
     }
 
 private:
@@ -148,52 +222,11 @@ private:
 
 namespace {
 
-[[noreturn]] Error parse_error(const std::string& msg, size_t pos) {
-    throw Error::make(ErrorCode::ConfigValidation, "expression parse error: " + msg).ctx("pos", std::to_string(pos));
-}
-
-std::string to_lower(const std::string& s) {
-    std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
-    return out;
-}
-
-int64_t parse_duration(const std::string& text) {
-    size_t i = 0;
-    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
-        ++i;
-    if (i == 0 || i == text.size())
-        return 0;
-    int64_t num = 0;
-    for (size_t k = 0; k < i; ++k)
-        num = num * 10 + (text[k] - '0');
-    std::string unit = to_lower(text.substr(i));
-    if (unit == "ms")
-        return num * 1000;
-    if (unit == "s")
-        return num * 1000000;
-    if (unit == "m")
-        return num * 60 * 1000000;
-    if (unit == "h")
-        return num * 3600 * 1000000;
-    if (unit == "d")
-        return num * 24 * 3600 * 1000000;
-    return 0; // unknown unit
-}
-
-bool is_duration_literal(const std::string& text) {
-    size_t i = 0;
-    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
-        ++i;
-    if (i == 0 || i == text.size())
-        return false;
-    std::string unit = to_lower(text.substr(i));
-    return unit == "ms" || unit == "s" || unit == "m" || unit == "h" || unit == "d";
-}
-
 class Parser {
 public:
-    explicit Parser(const std::string& src) : lex_(src) { advance(); }
+    explicit Parser(const std::string& src) : lex_(src) {
+        advance();
+    }
 
     ExprPtr parse() {
         auto result = parse_or();
@@ -203,10 +236,30 @@ public:
     }
 
 private:
+    // Bounds AST nesting (parens, IF/function args, unary chains) so that a
+    // pathological config expression cannot overflow the stack.
+    static constexpr size_t kMaxDepth = 100;
+
     Lexer lex_;
     Token cur_;
+    size_t depth_ = 0;
 
-    void advance() { cur_ = lex_.next(); }
+    void advance() {
+        cur_ = lex_.next();
+    }
+
+    struct DepthGuard {
+        Parser& p;
+        explicit DepthGuard(Parser& parser) : p(parser) {
+            if (++p.depth_ > kMaxDepth)
+                parse_error("expression nesting too deep", p.cur_.pos);
+        }
+        ~DepthGuard() {
+            --p.depth_;
+        }
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+    };
 
     bool match_op(const std::string& op) {
         if (cur_.kind == Tok::Op && cur_.text == op) {
@@ -215,14 +268,6 @@ private:
         }
         // Case-insensitive keywords (AND, OR, NOT) arrive as Ident tokens.
         if (cur_.kind == Tok::Ident && to_lower(cur_.text) == op) {
-            advance();
-            return true;
-        }
-        return false;
-    }
-
-    bool match_keyword(const std::string& kw) {
-        if (cur_.kind == Tok::Ident && to_lower(cur_.text) == kw) {
             advance();
             return true;
         }
@@ -333,6 +378,8 @@ private:
     }
 
     ExprPtr parse_primary() {
+        DepthGuard guard(*this);
+
         if (cur_.kind == Tok::Number) {
             auto node = std::make_unique<ExprNode>();
             node->kind = ExprNode::Kind::Number;
@@ -348,6 +395,29 @@ private:
                 node->kind = ExprNode::Kind::DurationLit;
                 node->identifier = text;
                 node->duration_us = parse_duration(text);
+                if (node->duration_us < 0)
+                    parse_error("duration literal out of range '" + text + "'", pos);
+                advance();
+                return node;
+            }
+            if (to_lower(text) == "if") {
+                advance();
+                if (cur_.kind != Tok::LParen)
+                    parse_error("expected '(' after IF", pos);
+                advance();
+                auto node = std::make_unique<ExprNode>();
+                node->kind = ExprNode::Kind::Conditional;
+                node->args.push_back(parse_or());
+                if (cur_.kind != Tok::Comma)
+                    parse_error("expected ',' in IF", pos);
+                advance();
+                node->args.push_back(parse_or());
+                if (cur_.kind != Tok::Comma)
+                    parse_error("expected ',' in IF", pos);
+                advance();
+                node->args.push_back(parse_or());
+                if (cur_.kind != Tok::RParen)
+                    parse_error("expected ')' after IF", pos);
                 advance();
                 return node;
             }
@@ -383,27 +453,6 @@ private:
             advance();
             return inner;
         }
-        if (cur_.kind == Tok::Ident && to_lower(cur_.text) == "if") {
-            advance();
-            if (cur_.kind != Tok::LParen)
-                parse_error("expected '(' after IF", cur_.pos);
-            advance();
-            auto node = std::make_unique<ExprNode>();
-            node->kind = ExprNode::Kind::Conditional;
-            node->args.push_back(parse_or());
-            if (cur_.kind != Tok::Comma)
-                parse_error("expected ',' in IF", cur_.pos);
-            advance();
-            node->args.push_back(parse_or());
-            if (cur_.kind != Tok::Comma)
-                parse_error("expected ',' in IF", cur_.pos);
-            advance();
-            node->args.push_back(parse_or());
-            if (cur_.kind != Tok::RParen)
-                parse_error("expected ')' after IF", cur_.pos);
-            advance();
-            return node;
-        }
         parse_error("unexpected token '" + cur_.text + "'", cur_.pos);
     }
 };
@@ -434,7 +483,56 @@ void collect_metric_refs(const ExprNode& node, std::vector<std::string>& out) {
 
 namespace {
 
+// Evaluates an argument expected to be numeric. A nullopt result means the argument
+// evaluated to Null (missing data), which callers propagate.
+Result<std::optional<double>> eval_number(const ExprNode& arg, const EvalContext& ctx, const std::string& fn) {
+    auto v = evaluate(arg, ctx);
+    if (!v.ok())
+        return Result<std::optional<double>>::Err(v.error());
+    if (v.value().type == ExprType::Null)
+        return Result<std::optional<double>>::Ok(std::nullopt);
+    auto n = v.value().as_number();
+    if (!n)
+        return Result<std::optional<double>>::Err(
+            Error::make(ErrorCode::InvalidArgument, fn + "() requires numeric args"));
+    return Result<std::optional<double>>::Ok(*n);
+}
+
 Result<ExprValue> eval_binary(const ExprNode& node, const EvalContext& ctx) {
+    const std::string& op = node.op;
+
+    // AND/OR short-circuit with SQL three-valued logic: a Boolean operand that decides
+    // the result wins; Null only propagates when neither side decides.
+    if (op == "and" || op == "or") {
+        auto left = evaluate(*node.args[0], ctx);
+        if (!left.ok())
+            return left;
+        std::optional<bool> lb;
+        if (left.value().type == ExprType::Boolean)
+            lb = left.value().as_bool();
+        else if (left.value().type != ExprType::Null)
+            return Result<ExprValue>::Err(
+                Error::make(ErrorCode::InvalidArgument, "'" + op + "' requires boolean operands"));
+        if (lb && ((op == "and" && !*lb) || (op == "or" && *lb)))
+            return Result<ExprValue>::Ok(ExprValue::make_bool(*lb));
+
+        auto right = evaluate(*node.args[1], ctx);
+        if (!right.ok())
+            return right;
+        std::optional<bool> rb;
+        if (right.value().type == ExprType::Boolean)
+            rb = right.value().as_bool();
+        else if (right.value().type != ExprType::Null)
+            return Result<ExprValue>::Err(
+                Error::make(ErrorCode::InvalidArgument, "'" + op + "' requires boolean operands"));
+        if (rb && ((op == "and" && !*rb) || (op == "or" && *rb)))
+            return Result<ExprValue>::Ok(ExprValue::make_bool(*rb));
+        if (lb && rb)
+            return Result<ExprValue>::Ok(
+                ExprValue::make_bool(op == "and" ? (*lb && *rb) : (*lb || *rb)));
+        return Result<ExprValue>::Ok(ExprValue::make_null());
+    }
+
     auto left = evaluate(*node.args[0], ctx);
     if (!left.ok())
         return left;
@@ -444,23 +542,10 @@ Result<ExprValue> eval_binary(const ExprNode& node, const EvalContext& ctx) {
     const ExprValue& l = left.value();
     const ExprValue& r = right.value();
 
-    const std::string& op = node.op;
-    if (op == "and") {
-        auto lb = l.as_bool();
-        auto rb = r.as_bool();
-        if (!lb || !rb)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "'and' requires boolean operands"));
-        return Result<ExprValue>::Ok(ExprValue::make_bool(*lb && *rb));
-    }
-    if (op == "or") {
-        auto lb = l.as_bool();
-        auto rb = r.as_bool();
-        if (!lb || !rb)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "'or' requires boolean operands"));
-        return Result<ExprValue>::Ok(ExprValue::make_bool(*lb || *rb));
-    }
+    // Missing data propagates as Null instead of failing the whole expression.
+    if (l.type == ExprType::Null || r.type == ExprType::Null)
+        return Result<ExprValue>::Ok(ExprValue::make_null());
 
-    // All remaining operators require numeric operands (Null propagates as error).
     auto ln = l.as_number();
     auto rn = r.as_number();
     if (!ln || !rn)
@@ -507,78 +592,76 @@ Result<ExprValue> eval_function(const ExprNode& node, const EvalContext& ctx) {
     const auto& args = node.args;
 
     if (fn == "abs") {
-        auto v = evaluate(*args[0], ctx);
-        if (!v.ok())
-            return v;
-        auto n = v.value().as_number();
-        if (!n)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "abs() requires numeric arg"));
-        return Result<ExprValue>::Ok(ExprValue::make_number(std::fabs(*n)));
+        if (args.size() != 1)
+            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "abs() requires exactly 1 arg"));
+        auto n = eval_number(*args[0], ctx, "abs");
+        if (!n.ok())
+            return Result<ExprValue>::Err(n.error());
+        if (!n.value())
+            return Result<ExprValue>::Ok(ExprValue::make_null());
+        return Result<ExprValue>::Ok(ExprValue::make_number(std::fabs(*n.value())));
     }
     if (fn == "min" || fn == "max") {
         if (args.size() < 2)
             return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, fn + "() requires at least 2 args"));
+        bool have = false;
         double best = 0;
-        bool first = true;
         for (const auto& arg : args) {
-            auto v = evaluate(*arg, ctx);
-            if (!v.ok())
-                return v;
-            auto n = v.value().as_number();
-            if (!n)
-                return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, fn + "() requires numeric args"));
-            if (first || (fn == "min" ? *n < best : *n > best)) {
-                best = *n;
-                first = false;
+            auto n = eval_number(*arg, ctx, fn);
+            if (!n.ok())
+                return Result<ExprValue>::Err(n.error());
+            if (!n.value())
+                return Result<ExprValue>::Ok(ExprValue::make_null());
+            if (!have || (fn == "min" ? *n.value() < best : *n.value() > best)) {
+                best = *n.value();
+                have = true;
             }
         }
         return Result<ExprValue>::Ok(ExprValue::make_number(best));
     }
     if (fn == "clamp") {
         if (args.size() != 3)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "clamp() requires 3 args"));
-        auto v = evaluate(*args[0], ctx);
+            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "clamp() requires exactly 3 args"));
+        auto v = eval_number(*args[0], ctx, "clamp");
         if (!v.ok())
-            return v;
-        auto lo = evaluate(*args[1], ctx);
+            return Result<ExprValue>::Err(v.error());
+        auto lo = eval_number(*args[1], ctx, "clamp");
         if (!lo.ok())
-            return lo;
-        auto hi = evaluate(*args[2], ctx);
+            return Result<ExprValue>::Err(lo.error());
+        auto hi = eval_number(*args[2], ctx, "clamp");
         if (!hi.ok())
-            return hi;
-        auto vn = v.value().as_number();
-        auto lon = lo.value().as_number();
-        auto hin = hi.value().as_number();
-        if (!vn || !lon || !hin)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "clamp() requires numeric args"));
-        double result = std::clamp(*vn, *lon, *hin);
-        return Result<ExprValue>::Ok(ExprValue::make_number(result));
+            return Result<ExprValue>::Err(hi.error());
+        if (!v.value() || !lo.value() || !hi.value())
+            return Result<ExprValue>::Ok(ExprValue::make_null());
+        // std::clamp is UB when lo > hi; reject instead.
+        if (*lo.value() > *hi.value())
+            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "clamp() requires lo <= hi"));
+        return Result<ExprValue>::Ok(ExprValue::make_number(std::clamp(*v.value(), *lo.value(), *hi.value())));
     }
     if (fn == "sqrt") {
-        auto v = evaluate(*args[0], ctx);
-        if (!v.ok())
-            return v;
-        auto n = v.value().as_number();
-        if (!n)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "sqrt() requires numeric arg"));
-        if (*n < 0)
+        if (args.size() != 1)
+            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "sqrt() requires exactly 1 arg"));
+        auto n = eval_number(*args[0], ctx, "sqrt");
+        if (!n.ok())
+            return Result<ExprValue>::Err(n.error());
+        if (!n.value())
+            return Result<ExprValue>::Ok(ExprValue::make_null());
+        if (*n.value() < 0)
             return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "sqrt() of negative number"));
-        return Result<ExprValue>::Ok(ExprValue::make_number(std::sqrt(*n)));
+        return Result<ExprValue>::Ok(ExprValue::make_number(std::sqrt(*n.value())));
     }
     if (fn == "pow") {
         if (args.size() != 2)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "pow() requires 2 args"));
-        auto base = evaluate(*args[0], ctx);
+            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "pow() requires exactly 2 args"));
+        auto base = eval_number(*args[0], ctx, "pow");
         if (!base.ok())
-            return base;
-        auto exp = evaluate(*args[1], ctx);
+            return Result<ExprValue>::Err(base.error());
+        auto exp = eval_number(*args[1], ctx, "pow");
         if (!exp.ok())
-            return exp;
-        auto bn = base.value().as_number();
-        auto en = exp.value().as_number();
-        if (!bn || !en)
-            return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "pow() requires numeric args"));
-        return Result<ExprValue>::Ok(ExprValue::make_number(std::pow(*bn, *en)));
+            return Result<ExprValue>::Err(exp.error());
+        if (!base.value() || !exp.value())
+            return Result<ExprValue>::Ok(ExprValue::make_null());
+        return Result<ExprValue>::Ok(ExprValue::make_number(std::pow(*base.value(), *exp.value())));
     }
 
     // Time-window functions: AVG(metric, duration), DELTA(metric, duration), RATE(metric, duration)
@@ -628,6 +711,8 @@ Result<ExprValue> eval_node(const ExprNode& node, const EvalContext& ctx) {
         auto child = evaluate(*node.args[0], ctx);
         if (!child.ok())
             return child;
+        if (child.value().type == ExprType::Null)
+            return Result<ExprValue>::Ok(ExprValue::make_null());
         if (node.op == "not") {
             auto b = child.value().as_bool();
             if (!b)
@@ -651,9 +736,13 @@ Result<ExprValue> eval_node(const ExprNode& node, const EvalContext& ctx) {
         auto cond = evaluate(*node.args[0], ctx);
         if (!cond.ok())
             return cond;
+        if (cond.value().type == ExprType::Null)
+            return Result<ExprValue>::Ok(ExprValue::make_null()); // undecided: no branch runs
         auto cb = cond.value().as_bool();
         if (!cb)
             return Result<ExprValue>::Err(Error::make(ErrorCode::InvalidArgument, "IF condition must be boolean"));
+        // Lazy: only the selected branch runs (the other may error or be expensive,
+        // e.g. IF(x > 0, y / x, 0)).
         return evaluate(*node.args[*cb ? 1 : 2], ctx);
     }
     }

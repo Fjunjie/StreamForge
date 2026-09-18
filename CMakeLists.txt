@@ -181,6 +181,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/support/test_env.cpp
         tests/unit/test_time.cpp
         tests/unit/test_error.cpp
+        tests/unit/test_expression.cpp
         tests/unit/test_bounded_queue.cpp
         tests/unit/test_log.cpp
         tests/unit/test_fs_util.cpp
@@ -200,6 +201,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_storage.cpp
         tests/unit/test_ingest.cpp
         tests/unit/test_pipeline.cpp
+        tests/unit/test_rules.cpp
         tests/unit/test_consistency.cpp
         tests/integration/test_cli.cpp)
     target_include_directories(streamforge-tests PRIVATE tests)
