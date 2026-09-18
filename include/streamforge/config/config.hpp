@@ -67,8 +67,14 @@ struct DerivedMetricCfg {
 
 struct RuleCfg {
     std::string id;
-    std::string type;     // threshold|duration|rate|absence|composite (semantics land in M3)
-    std::string severity; // info|warning|high|critical
+    std::string type;                                         // threshold|duration|rate|absence|composite
+    std::string severity;                                     // info|warning|high|critical
+    std::string trigger;                                      // expression evaluated on each sample (M3)
+    std::string recovery;                                     // optional recovery expression (M3)
+    int64_t duration_us = 0;                                  // condition sustain time (0 = immediate)
+    int64_t cooldown_us = 0;                                  // suppression after close
+    int64_t merge_interval_us = 0;                            // reopen window for recently-closed incidents
+    std::vector<std::pair<std::string, std::string>> devices; // tag selector
 };
 
 struct ServerConfig {
