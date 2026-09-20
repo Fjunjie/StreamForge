@@ -163,3 +163,34 @@ stage 2 从暂存表按游标分批读取，每条记录依次经过：
 每个暂存批次一个事务：样本批 + 暂存游标推进（`commit_stage2_batch`）；窗口关闭、
 迟到修正在提交后执行（读取已提交数据）。崩溃重放：从游标重放 → 去重去重余样本 →
 窗口重算覆盖 → 结果收敛一致（重放幂等，验收 §14.2 要求）。
+
+
+## 附：M3/M4 增量（业务层与服务层）
+
+### 规则与派生指标的执行位置
+
+```text
+staging → normalize → dedup → reorder → insert → gaps → windows   (M2 链路)
+                                    │
+                                    ├─ DerivedCalculator.observe()   派生指标（事件驱动）
+                                    └─ on_samples_committed 回调 → SampleBuffer → RuleEngine.evaluate_device()
+```
+
+- 派生指标在批次内同步计算，派生样本走与真实样本相同的去重键与 INSERT 路径
+  （重放幂等），带 `kDerived` 标志；批次提交后通过 `on_samples_committed` 把全部
+  落库样本交给宿主，宿主喂入滚动缓冲并按事件时间调用规则评估。
+- RuleEngine 持有互斥锁保护规则集与状态；`rule_states`/`incidents` 是唯一事实来源，
+  内存状态惰性恢复，重启不丢状态。
+
+### 热加载与生命周期
+
+- `AppRuntime` 负责加载-校验-原子替换：仅重启字段（database.path、bind/port、
+  workers、queue_capacity）变更直接拒绝；派生指标图重编译成功且规则编译成功后才替换。
+- `HttpApi` 是 httplib 的唯一使用者（业务层不见 HTTP 类型）；管理令牌恒定时间比较。
+- 保留清理每小时运行，按 10000 行/事务分批删除；开放事件、规则状态、检查点不清理。
+
+### 服务端线程模型
+
+主循环（扫描+导入+任务）单线程；HTTP 服务独立线程（内部工作线程池）；
+保留清理独立线程；规则评估在导入线程的批次提交点同步执行。
+共享点：Store（单连接 + 互斥）、SampleBuffer（互斥）、MetricsRegistry（互斥）。
