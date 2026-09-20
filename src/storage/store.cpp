@@ -1572,5 +1572,159 @@ Result<int64_t> Store::purge_retention(const RetentionConfig& retention, int64_t
     return Result<int64_t>::Ok(total);
 }
 
+Result<std::vector<DeviceMetricStats>> Store::summary_by_device_metric(const std::string& device_id,
+                                                                       const std::string& metric_id, int64_t from_us,
+                                                                       int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string sql = "SELECT device_id, metric_id, COUNT(*), SUM(value IS NULL),"
+                      " SUM(quality != 2), MIN(value), MAX(value), AVG(value) FROM samples"
+                      " WHERE event_time_us>=? AND event_time_us<?";
+    std::vector<std::pair<int, std::string>> texts;
+    int idx = 1;
+    if (!device_id.empty()) {
+        sql += " AND device_id=?";
+        texts.emplace_back(idx++, device_id);
+    }
+    if (!metric_id.empty()) {
+        sql += " AND metric_id=?";
+        texts.emplace_back(idx++, metric_id);
+    }
+    sql += " GROUP BY device_id, metric_id ORDER BY device_id, metric_id";
+    auto st = db_.prepare(sql);
+    if (!st.ok())
+        return Result<std::vector<DeviceMetricStats>>::Err(st.error());
+    auto b1 = st.value().bind_int64(idx++, from_us);
+    auto b2 = st.value().bind_int64(idx++, to_us);
+    if (!b1.ok() || !b2.ok())
+        return Result<std::vector<DeviceMetricStats>>::Err(Error::make(ErrorCode::DbStep, "summary bind failed"));
+    for (const auto& [i, v] : texts) {
+        auto bound = st.value().bind_text(i, v);
+        if (!bound.ok())
+            return Result<std::vector<DeviceMetricStats>>::Err(bound.error());
+    }
+    std::vector<DeviceMetricStats> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<DeviceMetricStats>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        DeviceMetricStats s;
+        s.device_id = st.value().column_text(0);
+        s.metric_id = st.value().column_text(1);
+        s.sample_count = st.value().column_int64(2);
+        s.null_count = st.value().column_int64(3);
+        s.bad_quality_count = st.value().column_int64(4);
+        if (!st.value().column_is_null(5))
+            s.min_value = st.value().column_double(5);
+        if (!st.value().column_is_null(6))
+            s.max_value = st.value().column_double(6);
+        if (!st.value().column_is_null(7))
+            s.avg_value = st.value().column_double(7);
+        rows.push_back(std::move(s));
+    }
+    return Result<std::vector<DeviceMetricStats>>::Ok(std::move(rows));
+}
+
+Result<std::vector<MissingSummary>> Store::missing_summary(const std::string& device_id, const std::string& metric_id,
+                                                           int64_t from_us, int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT device_id, metric_id, COUNT(*), SUM(expected_count) FROM missing_intervals"
+                          " WHERE start_us<? AND end_us>? AND device_id LIKE ? AND metric_id LIKE ?"
+                          " GROUP BY device_id, metric_id ORDER BY device_id, metric_id");
+    if (!st.ok())
+        return Result<std::vector<MissingSummary>>::Err(st.error());
+    auto b1 = st.value().bind_int64(1, to_us);
+    auto b2 = st.value().bind_int64(2, from_us);
+    auto b3 = st.value().bind_text(3, device_id.empty() ? "%" : device_id);
+    auto b4 = st.value().bind_text(4, metric_id.empty() ? "%" : metric_id);
+    if (!b1.ok() || !b2.ok() || !b3.ok() || !b4.ok())
+        return Result<std::vector<MissingSummary>>::Err(Error::make(ErrorCode::DbStep, "missing summary bind failed"));
+    std::vector<MissingSummary> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<MissingSummary>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        MissingSummary g;
+        g.device_id = st.value().column_text(0);
+        g.metric_id = st.value().column_text(1);
+        g.intervals = st.value().column_int64(2);
+        g.expected_count = st.value().column_is_null(3) ? 0 : st.value().column_int64(3);
+        rows.push_back(std::move(g));
+    }
+    return Result<std::vector<MissingSummary>>::Ok(std::move(rows));
+}
+
+Result<QualityStats> Store::quality_summary(int64_t from_us, int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    QualityStats out;
+    {
+        auto st = db_.prepare("SELECT COALESCE(SUM(record_count),0), COALESCE(SUM(accepted_count),0),"
+                              " COALESCE(SUM(format_errors),0), COALESCE(SUM(business_errors),0) FROM source_files"
+                              " WHERE first_seen_at_us>=? AND first_seen_at_us<?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, from_us);
+        auto b2 = st.value().bind_int64(2, to_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality files bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality files query failed"));
+        out.records = st.value().column_int64(0);
+        out.accepted = st.value().column_int64(1);
+        out.format_errors = st.value().column_int64(2);
+        out.business_errors = st.value().column_int64(3);
+    }
+    out.duplicates = std::max<int64_t>(0, out.records - out.accepted - out.format_errors - out.business_errors);
+    {
+        auto st = db_.prepare("SELECT"
+                              " SUM((flags & 2) != 0), SUM((flags & 4) != 0), SUM((flags & 32) != 0)"
+                              " FROM samples WHERE event_time_us>=? AND event_time_us<?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, from_us);
+        auto b2 = st.value().bind_int64(2, to_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality flags bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality flags query failed"));
+        out.late_samples = st.value().column_is_null(0) ? 0 : st.value().column_int64(0);
+        out.interpolated_samples = st.value().column_is_null(1) ? 0 : st.value().column_int64(1);
+        out.derived_samples = st.value().column_is_null(2) ? 0 : st.value().column_int64(2);
+    }
+    {
+        auto st = db_.prepare("SELECT COUNT(*) FROM missing_intervals WHERE start_us<? AND end_us>?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, to_us);
+        auto b2 = st.value().bind_int64(2, from_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality missing bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality missing query failed"));
+        out.missing_intervals = st.value().column_int64(0);
+    }
+    return Result<QualityStats>::Ok(out);
+}
+
+Result<int64_t> Store::data_cutoff_us(int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT COALESCE(MAX(event_time_us), 0) FROM samples WHERE event_time_us<=?");
+    if (!st.ok())
+        return Result<int64_t>::Err(st.error());
+    auto bound = st.value().bind_int64(1, to_us);
+    if (!bound.ok())
+        return Result<int64_t>::Err(bound.error());
+    auto step = st.value().step();
+    if (!step.ok() || step.value() != Stmt::Step::Row)
+        return Result<int64_t>::Err(Error::make(ErrorCode::DbStep, "data cutoff query failed"));
+    return Result<int64_t>::Ok(st.value().column_int64(0));
+}
+
 } // namespace storage
 } // namespace streamforge

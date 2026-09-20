@@ -169,7 +169,8 @@ sf_add_warnings(sf_processing)
 # ---------------------------------------------------------------------------
 add_library(sf_api STATIC
     src/api/api.cpp
-    src/api/runtime.cpp)
+    src/api/runtime.cpp
+    src/report/report.cpp)
 target_link_libraries(sf_api
     PUBLIC sf_config sf_rules sf_storage sf_ingest PRIVATE httplib::httplib)
 sf_add_warnings(sf_api)
@@ -181,8 +182,12 @@ add_executable(streamforge-server src/server_main.cpp)
 target_link_libraries(streamforge-server PRIVATE sf_api sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
 sf_add_warnings(streamforge-server)
 
+add_executable(streamforge-gen src/gen_main.cpp)
+target_link_libraries(streamforge-gen PRIVATE sf_config)
+sf_add_warnings(streamforge-gen)
+
 add_executable(streamforgectl src/ctl_main.cpp)
-target_link_libraries(streamforgectl PRIVATE sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
+target_link_libraries(streamforgectl PRIVATE sf_api sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
 sf_add_warnings(streamforgectl)
 
 # ---------------------------------------------------------------------------
@@ -213,6 +218,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_derived.cpp
         tests/unit/test_sample_buffer.cpp
         tests/unit/test_api.cpp
+        tests/unit/test_report.cpp
         tests/unit/test_validation.cpp
         tests/unit/test_config.cpp
         tests/unit/test_storage.cpp
@@ -230,6 +236,23 @@ if(STREAMFORGE_BUILD_TESTS)
         Catch2::Catch2WithMain sf_api sf_ingest sf_processing sf_rules sf_storage sf_config sf_core httplib::httplib)
     sf_add_warnings(streamforge-tests)
     add_test(NAME streamforge-all COMMAND streamforge-tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# libFuzzer entries (13.3): built only when explicitly requested
+# ---------------------------------------------------------------------------
+if(STREAMFORGE_BUILD_FUZZ)
+    add_executable(fuzz_tlm tests/fuzz/test_fuzz_tlm.cpp)
+    target_link_libraries(fuzz_tlm PRIVATE tlmcodec sf_core)
+    target_compile_options(fuzz_tlm PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_tlm PRIVATE -fsanitize=fuzzer)
+    sf_add_warnings(fuzz_tlm)
+
+    add_executable(fuzz_expression tests/fuzz/test_fuzz_expression.cpp)
+    target_link_libraries(fuzz_expression PRIVATE sf_processing)
+    target_compile_options(fuzz_expression PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_expression PRIVATE -fsanitize=fuzzer)
+    sf_add_warnings(fuzz_expression)
 endif()
 
 # ---------------------------------------------------------------------------

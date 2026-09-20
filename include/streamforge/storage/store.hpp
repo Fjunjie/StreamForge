@@ -198,6 +198,38 @@ struct TimelineEntry {
     std::string details_json;
 };
 
+// Per (device, metric) sample statistics for the summary report.
+struct DeviceMetricStats {
+    std::string device_id;
+    std::string metric_id;
+    int64_t sample_count = 0;
+    int64_t null_count = 0;
+    int64_t bad_quality_count = 0;
+    std::optional<double> min_value;
+    std::optional<double> max_value;
+    std::optional<double> avg_value;
+};
+
+struct MissingSummary {
+    std::string device_id;
+    std::string metric_id;
+    int64_t intervals = 0;
+    int64_t expected_count = 0;
+};
+
+// Ingestion/quality counters for the quality report.
+struct QualityStats {
+    int64_t records = 0;
+    int64_t accepted = 0;
+    int64_t duplicates = 0;
+    int64_t late_samples = 0;
+    int64_t interpolated_samples = 0;
+    int64_t derived_samples = 0;
+    int64_t missing_intervals = 0;
+    int64_t format_errors = 0;
+    int64_t business_errors = 0;
+};
+
 // Facade over SQLite: catalog sync, file lifecycle, staging, samples, incidents and audit.
 // All access is serialized through one connection (single-writer model, requirement FR-DB-003).
 class Store {
@@ -294,6 +326,16 @@ public:
     // checkpoints are never touched. Each transaction deletes at most batch_rows rows.
     // Returns the total number of deleted rows.
     Result<int64_t> purge_retention(const RetentionConfig& retention, int64_t batch_rows);
+
+    // --- report aggregations (FR-RPT-001, M4) ---
+    Result<std::vector<DeviceMetricStats>> summary_by_device_metric(const std::string& device_id,
+                                                                    const std::string& metric_id, int64_t from_us,
+                                                                    int64_t to_us);
+    Result<std::vector<MissingSummary>> missing_summary(const std::string& device_id, const std::string& metric_id,
+                                                        int64_t from_us, int64_t to_us);
+    Result<QualityStats> quality_summary(int64_t from_us, int64_t to_us);
+    // Newest sample at or before `to_us` (report data cutoff); 0 when none.
+    Result<int64_t> data_cutoff_us(int64_t to_us);
 
     // --- operations / audit ---
     Result<void> audit(const std::string& op, const std::string& actor, const std::string& target,

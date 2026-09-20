@@ -3,6 +3,7 @@
 // list/ack, db migrate, db check. Report creation and replay arrive in M3/M4.
 #include <algorithm>
 #include <cinttypes>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +16,8 @@
 #include "streamforge/config/config.hpp"
 #include "streamforge/core/time.hpp"
 #include "streamforge/ingest/pipeline.hpp"
+#include "streamforge/core/time.hpp"
+#include "streamforge/report/report.hpp"
 #include "streamforge/storage/store.hpp"
 
 namespace fs = std::filesystem;
@@ -37,6 +40,7 @@ struct Args {
     std::string device, metric, from, to;
     std::string state, severity;
     std::string by, comment;
+    std::string rtype, rformat, output;
     int64_t limit = 1000;
     bool recursive = false;
     bool wait = false;
@@ -109,6 +113,15 @@ bool parse_args(int argc, char** argv, Args& args) {
             if (!need_value("--limit", v))
                 return false;
             args.limit = std::strtoll(v.c_str(), nullptr, 10);
+        } else if (arg == "--type") {
+            if (!need_value("--type", args.rtype))
+                return false;
+        } else if (arg == "--format") {
+            if (!need_value("--format", args.rformat))
+                return false;
+        } else if (arg == "--output") {
+            if (!need_value("--output", args.output))
+                return false;
         } else if (arg == "--exclude-synthetic") {
             args.exclude_synthetic = true;
         } else if (arg == "--state") {
@@ -543,8 +556,8 @@ int run_ctl_main(int argc, char** argv) {
         return kExitOk;
     }
     {
-        static const char* kCommands[] = {"validate-config", "import",    "status", "devices",
-                                          "samples",         "incidents", "db"};
+        static const char* kCommands[] = {"validate-config", "import",    "status",   "devices", "samples",
+                                          "incidents",         "db",        "report"};
         bool known = false;
         for (const char* c : kCommands) {
             if (cmd == c)
@@ -563,8 +576,8 @@ int run_ctl_main(int argc, char** argv) {
         usage();
         return kExitArgError;
     }
-    static const char* kNeedsConfig[] = {"validate-config", "import",    "status", "devices",
-                                         "samples",         "incidents", "db"};
+    static const char* kNeedsConfig[] = {"validate-config", "import",    "status",   "devices", "samples",
+                                         "incidents",         "db",        "report"};
     for (const char* c : kNeedsConfig) {
         if (cmd == c && args.config.empty()) {
             std::fprintf(stderr, "--config is required for %s\n", cmd.c_str());
@@ -587,6 +600,55 @@ int run_ctl_main(int argc, char** argv) {
     auto store = must_open_store(*cs);
     if (store == nullptr)
         return kExitBusinessFailure;
+
+
+    if (cmd == "report") {
+        if (args.positional1 != "create") {
+            std::fprintf(stderr, "usage: streamforgectl report create --type <summary|incident|quality>"
+                                 " --from <time> --to <time> --format <csv|json> --output <file> --config <file>\n");
+            return kExitArgError;
+        }
+        streamforge::report::Request req;
+        auto type = streamforge::report::parse_type(args.rtype);
+        if (!type.ok()) {
+            std::fprintf(stderr, "%s\n", type.error().message.c_str());
+            return kExitArgError;
+        }
+        req.type = type.take();
+        auto format = streamforge::report::parse_format(args.rformat.empty() ? "csv" : args.rformat);
+        if (!format.ok()) {
+            std::fprintf(stderr, "%s\n", format.error().message.c_str());
+            return kExitArgError;
+        }
+        req.format = format.take();
+        if (args.from.empty() || args.to.empty() || args.output.empty()) {
+            std::fprintf(stderr, "--from, --to and --output are required for report create\n");
+            return kExitArgError;
+        }
+        req.output_path = args.output;
+        req.device_id = args.device;
+        req.metric_id = args.metric;
+        auto from = streamforge::parse_admin_time(args.from);
+        auto to = streamforge::parse_admin_time(args.to);
+        if (!from.ok() || !to.ok()) {
+            std::fprintf(stderr, "invalid --from/--to time\n");
+            return kExitArgError;
+        }
+        req.from_us = std::chrono::duration_cast<std::chrono::microseconds>(from.value().time_since_epoch()).count();
+        req.to_us = std::chrono::duration_cast<std::chrono::microseconds>(to.value().time_since_epoch()).count();
+        auto result = streamforge::report::generate(*store, *cs, req);
+        if (!result.ok()) {
+            std::fprintf(stderr, "report generation failed: %s\n", result.error().message.c_str());
+            return kExitBusinessFailure;
+        }
+        if (!args.json_output)
+            std::printf("report written: %s (rows=%lld)\n", result.value().output_path.c_str(),
+                        static_cast<long long>(result.value().rows));
+        else
+            std::printf("{\"rows\": %lld, \"path\": \"%s\"}\n", static_cast<long long>(result.value().rows),
+                        result.value().output_path.c_str());
+        return kExitOk;
+    }
 
     // Keep the catalog in step with the configuration for every write-path command.
     if (cmd == "import" || cmd == "db") {
