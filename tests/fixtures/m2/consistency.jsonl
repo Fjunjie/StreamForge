@@ -1,0 +1,4 @@
+{"device_id":"dev-01","metric":"temp","event_time":"2026-09-01T00:16:40Z","value":76.4,"unit":"C","tags":{"line":"A"},"sequence":1}
+{"device_id":"dev-01","metric":"temp","event_time":"2026-09-01T00:16:50Z","value":null,"unit":"C","tags":{},"sequence":2}
+{"device_id":"dev-02","metric":"temp","event_time":"2026-09-01T00:16:40Z","value":10.0,"unit":"C","tags":{"zone":"w"}}
+{"device_id":"dev-01","metric":"pressure","event_time":"2026-09-01T00:17:00Z","value":300.0,"unit":"kPa","tags":{},"quality":1,"sequence":9}

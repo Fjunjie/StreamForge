@@ -1,0 +1,5 @@
+device_id,metric,event_time,value,unit,quality,sequence,tags
+dev-01,temp,2026-09-01T00:16:40Z,76.4,C,0,1,line=A
+dev-01,temp,2026-09-01T00:16:50Z,,C,0,2,
+dev-02,temp,2026-09-01T00:16:40Z,10.0,C,0,,zone=w
+dev-01,pressure,2026-09-01T00:17:00Z,300.0,kPa,1,9,

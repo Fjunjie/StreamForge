@@ -106,12 +106,60 @@ FetchContent 缓存默认在源树 `.deps/cache`（gitignore），首次拉取�
   json 为自定义 formatter（ts/level/component/thread/msg，消息 JSON 转义）。
   轮转文件 + 控制台，级别与轮转参数来自配置。
 
-## 5. 已知限制（M1）
+## 5. 已知限制（M2）
 
-- HTTP API、热加载、规则/表达式引擎、窗口聚合、数据保留清理：M2/M3 交付。
-- `.tlm` 文件被发现但暂不处理（M2）；`streamforgectl report/replay` 未提供（M3/M4）。
-- server 目录扫描为顺序处理（单文件内串行，多文件排队于扫描循环）；M2 引入
-  BoundedQueue 流水线与多工作线程后并行化。BoundedQueue 已实现并有并发测试。
+- HTTP API、热加载、规则/表达式引擎、数据保留清理：M3 交付；`streamforgectl
+  report/replay` 未提供（M3/M4）。
+- server 目录扫描为顺序处理（单文件内串行，多文件排队于扫描循环）；BoundedQueue
+  已实现并有并发测试，多工作线程并行化在 M3 与规则引擎一起接入。
 - 隔离/归档物理移动失败时 DB 状态为准，移动由下一次恢复流程重试（日志告警）。
 - CSV 解析要求秒字段存在（ISO 8601 子集，`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]`），
   与 FR-FMT-001/002 的示例一致。
+
+## 6. M2：二进制接入与时序处理
+
+### 6.1 libtlmcodec（C11）
+
+`c/tlmcodec/` 提供 TLM 二进制协议的 C11 编解码：文件头（CRC-32/ISO-HDLC 校验）、
+帧解析（sync/类型/flags/负载上限 4MiB/负载 CRC）、zlib 解压、TLV 字典（必填/重复/
+字符集校验，未知 TLV 跳过）、严格文件内序号、损坏帧后最多 1 MiB 的同步字扫描。
+所有整数逐字节小端装配，天然对齐安全。协议全文见 `docs/tlm-protocol.md`。
+
+C++ 侧 `ingest/tlm_parser.hpp` 流式封装：文件头校验、检查点偏移（帧边界）、序号
+状态（持久化于 checkpoint 的 stage2_cursor 列）、恢复后数据标记 `quality=Suspicious`
+并附 `resync=true` 标签（FR-FMT-004）。
+
+### 6.2 时序处理链（stage 2 正式流水线）
+
+stage 2 从暂存表按游标分批读取，每条记录依次经过：
+
+1. **校准**（FR-VAL-003）：分段线性 `[min,max)` 闭开区间，未匹配按配置拒绝或透传。
+2. **单位换算**（FR-VAL-004）：内置 C/F/K、Pa/kPa/MPa/bar、mm/s/cm/s/m/s、W/kW/MW、
+   L/min/m3/h/m3/s 仿射换算（base = value*scale + offset），检测溢出与物理无效值
+   （低于绝对零度、负压力/流速/功率/流量），库表位于 `core/units.hpp`（配置校验与
+   运行时共用）。之后应用配置的 valid_min/valid_max。
+3. **去重**（FR-ORD-001，⑥ 裁决）：LRU 热点缓存 + SQLite 唯一索引权威。键：有序号
+   `(device, metric, sequence)`；无序号 `(device, metric, event_time, normalized_value)`
+   （normalized_value 为 IEEE 754 位模式十六进制，-0/0 归一）。迁移 0003 将无序号
+   唯一索引收窄至 `sequence IS NULL`，避免误伤有序号记录。`INSERT OR IGNORE` 为
+   最终防线。
+4. **水位线重排**（FR-ORD-002）：每设备 `wm = max_seen - allowed_lateness`；晚于
+   水位线的样本立即发射并标记 `kLate`；缓冲区有记录数/字节数上限，触顶强制推进
+   并标记 `kForcedFlush`。**每批提交前强制 drain**——"cursor 前进 ⟹ 样本已持久化"，
+   崩溃重放精确无丢失。
+5. **缺失检测与插值**（FR-MIS-001/002）：相邻有效样本（排除 quality=2）间隔超过
+   `period+jitter` 产生缺失区间（迁移 0002 唯一索引保证重放幂等）；`previous/linear`
+   插值在 `max_gap` 内生成 `kSynthetic` 样本（⑦a：计入聚合 synthetic_count，区间
+   始终保留；异常规则是否使用由规则配置决定）。
+6. **窗口聚合**（FR-AGG-001/003）：固定窗口（配置秒数，UTC 对齐）在水位线越过
+   窗口末端时关闭——统计从 samples 表重算（Welford 方差、Kahan 求和、最近秩精确
+   分位数），幂等且崩溃安全；`(device,metric,type,start,version)` 版本化，迟到数据
+   在 `window_correction: true` 时废弃旧版本并追加新版本，默认不动已关闭窗口。
+   **滚动窗口**（FR-AGG-002）由 `processing/rolling.hpp` 的增量 `RollingSeries`
+   （计数/时长双模式）支撑，供 M3 规则引擎使用。
+
+### 6.3 stage 2 提交边界
+
+每个暂存批次一个事务：样本批 + 暂存游标推进（`commit_stage2_batch`）；窗口关闭、
+迟到修正在提交后执行（读取已提交数据）。崩溃重放：从游标重放 → 去重去重余样本 →
+窗口重算覆盖 → 结果收敛一致（重放幂等，验收 §14.2 要求）。

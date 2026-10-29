@@ -94,11 +94,21 @@ function(sf_add_warnings tgt)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# libtlmcodec: C11 TLM binary protocol codec (M2)
+# ---------------------------------------------------------------------------
+add_library(tlmcodec STATIC c/tlmcodec/tlmcodec.c)
+target_include_directories(tlmcodec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/c/tlmcodec)
+target_compile_features(tlmcodec PUBLIC c_std_11)
+target_link_libraries(tlmcodec PUBLIC ZLIB::ZLIB)
+sf_add_warnings(tlmcodec)
+
+# ---------------------------------------------------------------------------
 # Libraries
 # ---------------------------------------------------------------------------
 add_library(sf_core STATIC
     src/core/error.cpp
     src/core/time.cpp
+    src/core/units.cpp
     src/core/uuid.cpp
     src/core/log.cpp
     src/core/fs_util.cpp)
@@ -126,24 +136,34 @@ add_library(sf_ingest STATIC
     src/ingest/line_reader.cpp
     src/ingest/csv/csv_parser.cpp
     src/ingest/jsonl/jsonl_parser.cpp
+    src/ingest/tlm/tlm_parser.cpp
     src/ingest/validation.cpp
     src/ingest/file_identity.cpp
     src/ingest/discovery.cpp
     src/ingest/archive.cpp
     src/ingest/error_report.cpp
     src/ingest/pipeline.cpp)
-target_link_libraries(sf_ingest PUBLIC sf_storage PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+target_link_libraries(sf_ingest PUBLIC sf_storage sf_processing tlmcodec PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
 sf_add_warnings(sf_ingest)
+
+add_library(sf_processing STATIC
+    src/processing/calibration.cpp
+    src/processing/dedup.cpp
+    src/processing/watermark.cpp
+    src/processing/missing.cpp
+    src/processing/windows.cpp)
+target_link_libraries(sf_processing PUBLIC sf_config sf_storage nlohmann_json::nlohmann_json)
+sf_add_warnings(sf_processing)
 
 # ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(streamforge-server src/server_main.cpp)
-target_link_libraries(streamforge-server PRIVATE sf_ingest sf_storage sf_config sf_core)
+target_link_libraries(streamforge-server PRIVATE sf_ingest sf_processing sf_storage sf_config sf_core)
 sf_add_warnings(streamforge-server)
 
 add_executable(streamforgectl src/ctl_main.cpp)
-target_link_libraries(streamforgectl PRIVATE sf_ingest sf_storage sf_config sf_core)
+target_link_libraries(streamforgectl PRIVATE sf_ingest sf_processing sf_storage sf_config sf_core)
 sf_add_warnings(streamforgectl)
 
 # ---------------------------------------------------------------------------
@@ -160,11 +180,21 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_fs_util.cpp
         tests/unit/test_csv.cpp
         tests/unit/test_jsonl.cpp
+        tests/unit/test_tlmcodec.cpp
+        tests/unit/test_tlm_pipeline.cpp
+        tests/unit/test_units.cpp
+        tests/unit/test_calibration.cpp
+        tests/unit/test_dedup.cpp
+        tests/unit/test_watermark.cpp
+        tests/unit/test_missing_interp.cpp
+        tests/unit/test_windows.cpp
+        tests/unit/test_rolling.cpp
         tests/unit/test_validation.cpp
         tests/unit/test_config.cpp
         tests/unit/test_storage.cpp
         tests/unit/test_ingest.cpp
         tests/unit/test_pipeline.cpp
+        tests/unit/test_consistency.cpp
         tests/integration/test_cli.cpp)
     target_include_directories(streamforge-tests PRIVATE tests)
     target_compile_definitions(streamforge-tests PRIVATE
@@ -172,7 +202,7 @@ if(STREAMFORGE_BUILD_TESTS)
         STREAMFORGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         STREAMFORGE_CTL_BIN="$<TARGET_FILE:streamforgectl>")
     target_link_libraries(streamforge-tests PRIVATE
-        Catch2::Catch2WithMain sf_ingest sf_storage sf_config sf_core)
+        Catch2::Catch2WithMain sf_ingest sf_processing sf_storage sf_config sf_core)
     sf_add_warnings(streamforge-tests)
     add_test(NAME streamforge-all COMMAND streamforge-tests)
 endif()
