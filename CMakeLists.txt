@@ -147,23 +147,29 @@ target_link_libraries(sf_ingest PUBLIC sf_storage sf_processing tlmcodec PRIVATE
 sf_add_warnings(sf_ingest)
 
 add_library(sf_processing STATIC
+    src/processing/expression.cpp
     src/processing/calibration.cpp
     src/processing/dedup.cpp
     src/processing/watermark.cpp
     src/processing/missing.cpp
     src/processing/windows.cpp)
 target_link_libraries(sf_processing PUBLIC sf_config sf_storage nlohmann_json::nlohmann_json)
+
+add_library(sf_rules STATIC
+    src/rules/rule_engine.cpp)
+target_link_libraries(sf_rules PUBLIC sf_processing sf_storage nlohmann_json::nlohmann_json)
+sf_add_warnings(sf_rules)
 sf_add_warnings(sf_processing)
 
 # ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(streamforge-server src/server_main.cpp)
-target_link_libraries(streamforge-server PRIVATE sf_ingest sf_processing sf_storage sf_config sf_core)
+target_link_libraries(streamforge-server PRIVATE sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
 sf_add_warnings(streamforge-server)
 
 add_executable(streamforgectl src/ctl_main.cpp)
-target_link_libraries(streamforgectl PRIVATE sf_ingest sf_processing sf_storage sf_config sf_core)
+target_link_libraries(streamforgectl PRIVATE sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
 sf_add_warnings(streamforgectl)
 
 # ---------------------------------------------------------------------------
@@ -175,6 +181,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/support/test_env.cpp
         tests/unit/test_time.cpp
         tests/unit/test_error.cpp
+        tests/unit/test_expression.cpp
         tests/unit/test_bounded_queue.cpp
         tests/unit/test_log.cpp
         tests/unit/test_fs_util.cpp
@@ -194,6 +201,7 @@ if(STREAMFORGE_BUILD_TESTS)
         tests/unit/test_storage.cpp
         tests/unit/test_ingest.cpp
         tests/unit/test_pipeline.cpp
+        tests/unit/test_rules.cpp
         tests/unit/test_consistency.cpp
         tests/integration/test_cli.cpp)
     target_include_directories(streamforge-tests PRIVATE tests)
@@ -202,7 +210,7 @@ if(STREAMFORGE_BUILD_TESTS)
         STREAMFORGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         STREAMFORGE_CTL_BIN="$<TARGET_FILE:streamforgectl>")
     target_link_libraries(streamforge-tests PRIVATE
-        Catch2::Catch2WithMain sf_ingest sf_processing sf_storage sf_config sf_core)
+        Catch2::Catch2WithMain sf_ingest sf_processing sf_rules sf_storage sf_config sf_core)
     sf_add_warnings(streamforge-tests)
     add_test(NAME streamforge-all COMMAND streamforge-tests)
 endif()
