@@ -119,6 +119,23 @@ build/streamforgectl db check   --config config/example.yaml
 | `incidents list [--state open] [--severity high]` | 事件查询（M1 表为空属正常） |
 | `incidents ack <id> --by <name> [--comment]` | 确认事件并写入历史与审计 |
 | `db migrate` / `db check` | 迁移到最新版本 / 完整性与外键检查 |
+| `report create --type <summary\|incident\|quality> --from --to --format <csv\|json> --output <f>` | 报表导出（M4） |
+
+退出码：`0` 成功，`1` 业务失败，`2` 参数错误。`--output json` 时进度文本走 stderr，
+stdout 只有 JSON。
+
+### 服务端能力（M3/M4）
+
+- **HTTP API**：`/health`、`/ready`、`/metrics`（Prometheus）与 `/api/v1/` 下的设备、
+  样本、聚合、事件查询与确认；管理接口（reload/import/jobs）需要 Bearer 令牌
+  （环境变量 `STREAMFORGE_ADMIN_TOKEN` 或 `server.admin_token_file`）。完整参考见
+  [docs/API.md](docs/API.md)。
+- **派生指标与规则**：受限表达式语言驱动的事件派生计算与五态告警状态机
+  （NORMAL→PENDING→FIRING→RECOVERING→COOLDOWN），事件开/关/重开/确认全部持久化。
+- **配置热加载**：`SIGHUP` 或 `POST /api/v1/admin/reload`；校验失败或仅重启字段
+  变更时保持旧配置继续工作。
+- **数据保留**：按 `retention` 配置每小时分批清理样本/聚合/已关闭事件/审计，
+  开放事件与规则状态永不清理。
 
 退出码：`0` 成功，`1` 业务失败，`2` 参数错误。`--output json` 时进度文本走 stderr，
 stdout 只有 JSON。
@@ -164,6 +181,9 @@ stdout 只有 JSON。
 ## 8. 文档
 
 - [docs/architecture.md](docs/architecture.md)：模块职责、两阶段暂存设计、关键决策、已知限制。
-- [docs/tlm-protocol.md](docs/tlm-protocol.md)：TLM 二进制协议（草案，含 CRC32 参数与
-  可人工核对的十六进制示例），M2 实现前供审查。
+- [docs/tlm-protocol.md](docs/tlm-protocol.md)：TLM 二进制协议（M2 已实现，含 CRC32 参数与
+  可人工核对的十六进制示例）。
+- [docs/API.md](docs/API.md)：HTTP API 参考（M3/M4）。
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：配置参考（含派生指标表达式与规则语义）。
+- [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)：M4 验收记录（构建矩阵、功能对照、性能测试命令）。
 - 需求来源：`StreamForge_需求规格说明书.md`（仓库根目录）。

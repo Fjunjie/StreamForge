@@ -14,6 +14,7 @@
 #include "streamforge/ingest/file_identity.hpp"
 #include "streamforge/processing/calibration.hpp"
 #include "streamforge/processing/dedup.hpp"
+#include "streamforge/processing/derived.hpp"
 #include "streamforge/processing/missing.hpp"
 #include "streamforge/processing/types.hpp"
 #include "streamforge/processing/watermark.hpp"
@@ -59,7 +60,26 @@ public:
     // Graceful shutdown: checked between batches; when true the file stays resumable.
     std::function<bool()> should_stop;
 
+    // One sample durably written by a stage-2 batch (real, interpolated or derived).
+    // Null-valued samples are not reported (they carry no value to aggregate).
+    struct CommittedSample {
+        std::string device_id;
+        std::string metric_id;
+        int64_t event_time_us = 0;
+        double value = 0.0;
+        std::string unit; // canonical unit
+    };
+    // Invoked after each stage-2 batch (and the EOF tail) is durably committed, with
+    // every sample that batch wrote. The host feeds rolling state and rule evaluation
+    // from here (M3/M4). Called on the pipeline thread.
+    std::function<void(const std::vector<CommittedSample>&)> on_samples_committed;
+
     ProcessResult process_file(const std::string& path);
+
+    // Hot-reload support (FR-CFG-003): swaps the configuration snapshot and recompiles
+    // the derived-metric graph. Call between files; on a compile error the previous
+    // configuration stays active and the error is returned.
+    Result<void> update_config(std::shared_ptr<const ConfigSnapshot> cs);
 
     // Startup recovery (FR-REC-002): resumes files left PROCESSING/VALIDATED, marks rows whose
     // source changed, and completes pending archive moves for COMPLETED files.
@@ -91,15 +111,29 @@ private:
     [[nodiscard]] Result<processing::NormalizedSample> normalize_staged(const storage::StagedRecord& r) const;
     // Processes one normalized sample: dedup pre-check, sample row for the current batch
     // and window registration. Synthetic samples skip the dedup pre-check and rely on
-    // INSERT OR IGNORE. Returns the row appended to `out`.
-    Result<void> process_emitted(const storage::SourceFileRow& file, processing::NormalizedSample& s, bool synthetic,
+    // INSERT OR IGNORE. Returns the row appended to `out`; the bool reports whether the
+    // sample was inserted (false = duplicate).
+    Result<bool> process_emitted(const storage::SourceFileRow& file, processing::NormalizedSample& s, bool synthetic,
                                  std::vector<storage::SampleRow>& out);
+    // Full drain path of one real sample: insert, late tracking, gap feed and the
+    // derived samples it triggers. The bool reports insertion (false = duplicate).
+    Result<bool> emit_real(const storage::SourceFileRow& file, processing::NormalizedSample& s,
+                           std::vector<storage::SampleRow>& samples, std::vector<processing::NormalizedSample>& late);
+    // Computes and appends the derived samples triggered by a freshly inserted sample.
+    Result<void> emit_derived_for(const storage::SourceFileRow& file, const processing::NormalizedSample& trigger,
+                                  std::vector<storage::SampleRow>& samples);
     ProcessResult quarantine_now(const storage::SourceFileRow& row, const std::string& error_code,
                                  const std::string& summary, const Stage1Context& ctx);
 
     std::shared_ptr<const ConfigSnapshot> cs_;
     std::shared_ptr<storage::Store> store_;
     int fault_batch_counter_ = 0; // global batch index across both stages of one file
+    // Derived-metric graph compiled from cs_; empty derived_error_ means usable.
+    std::unique_ptr<processing::DerivedCalculator> derived_;
+    std::string derived_error_;
+    // Samples written by the current stage-2 batch, flushed to on_samples_committed
+    // once the batch is durable.
+    std::vector<CommittedSample> committed_;
     // Per-file stage-2 context (rebuilt from the database on resume).
     std::unique_ptr<processing::DedupIndex> dedup_;
     std::unique_ptr<processing::WindowAggregator> windows_;

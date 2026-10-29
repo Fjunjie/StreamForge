@@ -27,7 +27,26 @@ using nlohmann::json;
 using storage::FileStatus;
 
 ImportPipeline::ImportPipeline(std::shared_ptr<const ConfigSnapshot> cs, std::shared_ptr<storage::Store> store)
-    : cs_(std::move(cs)), store_(std::move(store)) {}
+    : cs_(std::move(cs)), store_(std::move(store)) {
+    // The derived-metric graph is compiled once per configuration; a compile error is
+    // reported when stage 2 runs (the host validates earlier on startup/reload).
+    auto d = processing::DerivedCalculator::create(*cs_);
+    if (d.ok()) {
+        derived_ = std::make_unique<processing::DerivedCalculator>(d.take());
+    } else {
+        derived_error_ = d.error().message;
+    }
+}
+
+Result<void> ImportPipeline::update_config(std::shared_ptr<const ConfigSnapshot> cs) {
+    auto d = processing::DerivedCalculator::create(*cs);
+    if (!d.ok())
+        return Result<void>::Err(d.error()); // previous configuration stays active
+    cs_ = std::move(cs);
+    derived_ = std::make_unique<processing::DerivedCalculator>(d.take());
+    derived_error_.clear();
+    return Result<void>::Ok();
+}
 
 namespace {
 
@@ -752,7 +771,7 @@ Result<processing::NormalizedSample> ImportPipeline::normalize_staged(const stor
 
 // Processes one normalized sample: dedup pre-check, sample row for the current batch and
 // window registration (closed windows are skipped; only correction may touch them).
-Result<void> ImportPipeline::process_emitted(const storage::SourceFileRow& file, processing::NormalizedSample& s,
+Result<bool> ImportPipeline::process_emitted(const storage::SourceFileRow& file, processing::NormalizedSample& s,
                                              bool synthetic, std::vector<storage::SampleRow>& out) {
     if (synthetic)
         s.flags |= sample_flags::kSynthetic;
@@ -760,9 +779,9 @@ Result<void> ImportPipeline::process_emitted(const storage::SourceFileRow& file,
     if (!synthetic) {
         auto dup = dedup_->is_duplicate(s);
         if (!dup.ok())
-            return Result<void>::Err(dup.error());
+            return Result<bool>::Err(dup.error());
         if (dup.value())
-            return Result<void>::Ok();
+            return Result<bool>::Ok(false);
     }
     storage::SampleRow out_row;
     out_row.sample_uuid = uuid_v4();
@@ -784,7 +803,62 @@ Result<void> ImportPipeline::process_emitted(const storage::SourceFileRow& file,
     out_row.normalized_value = processing::normalized_value_text(s.value_is_null, s.value);
     out.push_back(std::move(out_row));
     dedup_->mark_seen(s);
+
+    if (!s.value_is_null) {
+        const auto* m = cs_->cfg.metric(s.metric_id);
+        CommittedSample c;
+        c.device_id = s.device_id;
+        c.metric_id = s.metric_id;
+        c.event_time_us = s.event_time_us;
+        c.value = s.value;
+        c.unit = m != nullptr ? m->canonical_unit : s.input_unit;
+        committed_.push_back(std::move(c));
+    }
+    return Result<bool>::Ok(true);
+}
+
+// Computes and appends the derived samples a freshly inserted real sample triggers
+// (FR-DER-002). Derived rows carry the kDerived flag, go through the dedup keys like
+// real samples (replay idempotency) and register in the window aggregator.
+Result<void> ImportPipeline::emit_derived_for(const storage::SourceFileRow& file,
+                                              const processing::NormalizedSample& trigger,
+                                              std::vector<storage::SampleRow>& samples) {
+    if (!derived_)
+        return Result<void>::Ok();
+    auto outs = derived_->observe(trigger);
+    for (const auto& o : outs) {
+        processing::NormalizedSample dn;
+        dn.device_id = trigger.device_id;
+        dn.metric_id = o.metric_id;
+        dn.event_time_us = o.event_time_us;
+        dn.ingest_time_us = trigger.ingest_time_us;
+        dn.value_is_null = o.value_is_null;
+        dn.value = o.value;
+        dn.input_unit = o.unit; // derived samples carry their canonical unit
+        dn.quality = 2;
+        dn.flags = sample_flags::kDerived;
+        auto rc = process_emitted(file, dn, /*synthetic=*/false, samples);
+        if (!rc.ok())
+            return Result<void>::Err(rc.error());
+    }
     return Result<void>::Ok();
+}
+
+Result<bool> ImportPipeline::emit_real(const storage::SourceFileRow& file, processing::NormalizedSample& s,
+                                       std::vector<storage::SampleRow>& samples,
+                                       std::vector<processing::NormalizedSample>& late) {
+    auto rc = process_emitted(file, s, /*synthetic=*/false, samples);
+    if (!rc.ok())
+        return rc;
+    if (rc.value()) {
+        if ((s.flags & sample_flags::kLate) != 0)
+            late.push_back(s);
+        gaps_->feed(s);
+        auto derived = emit_derived_for(file, s, samples);
+        if (!derived.ok())
+            return Result<bool>::Err(derived.error());
+    }
+    return rc;
 }
 
 Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
@@ -794,6 +868,10 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
     const auto& cp_row = cp.value();
     int64_t cursor = cp_row ? cp_row->stage2_cursor : 0;
     const int64_t batch_size = cs_->cfg.pipeline.batch_size;
+
+    if (!derived_error_.empty())
+        return Result<void>::Err(
+            Error::make(ErrorCode::ConfigValidation, "derived metrics failed to compile: " + derived_error_));
 
     init_stage2_context(row);
     std::vector<processing::NormalizedSample> late_corrections;
@@ -840,12 +918,9 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
             // Drain everything the reorder buffer released (ordered per device); late
             // corrections run after the batch commit so windows read committed data.
             for (auto& s : *emitted_) {
-                auto rc = process_emitted(row, s, false, samples);
+                auto rc = emit_real(row, s, samples, late_corrections);
                 if (!rc.ok())
                     return Result<void>::Err(rc.error());
-                if ((s.flags & sample_flags::kLate) != 0)
-                    late_corrections.push_back(s);
-                gaps_->feed(s);
             }
             emitted_->clear();
             // Synthetic interpolation samples join the same batch; the gap that produced
@@ -872,12 +947,9 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
         for (const auto& device : touched_devices) {
             reorder_->flush_device(device, /*mark_forced=*/false);
             for (auto& s : *emitted_) {
-                auto rc = process_emitted(row, s, false, samples);
+                auto rc = emit_real(row, s, samples, late_corrections);
                 if (!rc.ok())
                     return Result<void>::Err(rc.error());
-                if ((s.flags & sample_flags::kLate) != 0)
-                    late_corrections.push_back(s);
-                gaps_->feed(s);
             }
             emitted_->clear();
             for (auto& s : *synth_buffer_) {
@@ -920,6 +992,12 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
                 return Result<void>::Err(corrected.error());
         }
         late_corrections.clear();
+
+        // The batch is durable: hand the committed samples to the host (rolling state
+        // and rule evaluation, M3/M4).
+        if (on_samples_committed && !committed_.empty())
+            on_samples_committed(committed_);
+        committed_.clear();
     }
 
     // End of file: drain the reorder buffers (regular end-of-stream, no forced_flush
@@ -930,14 +1008,9 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
     for (const auto& device : seeded_devices_) {
         reorder_->flush_device(device, /*mark_forced=*/false);
         for (auto& s : *emitted_) {
-            auto rc = process_emitted(row, s, false, tail_samples);
+            auto rc = emit_real(row, s, tail_samples, tail_late);
             if (!rc.ok())
                 return Result<void>::Err(rc.error());
-            // Tail late samples must receive the same correction treatment as the main
-            // loop (audit #5): collect and apply after the samples are durable.
-            if ((s.flags & sample_flags::kLate) != 0)
-                tail_late.push_back(s);
-            gaps_->feed(s);
         }
         emitted_->clear();
         for (auto& s : *synth_buffer_) {
@@ -978,6 +1051,11 @@ Result<void> ImportPipeline::run_stage2(const storage::SourceFileRow& row) {
         if (!all.ok())
             return Result<void>::Err(all.error());
     }
+
+    // EOF tail is durable: flush the committed samples to the host.
+    if (on_samples_committed && !committed_.empty())
+        on_samples_committed(committed_);
+    committed_.clear();
 
     if (stage2_dropped > 0) {
         SPDLOG_LOGGER_INFO(logger("ingest"), "file {}: stage 2 dropped {} records", row.path, stage2_dropped);

@@ -179,6 +179,27 @@ Result<void> Store::sync_catalog(const ConfigSnapshot& cs) {
         }
     }
 
+    // Derived metrics live in the same catalog: derived samples share the samples data
+    // model (FR-DER-002), whose foreign keys require a metrics row.
+    for (const auto& dm : cs.cfg.derived_metrics) {
+        static const char* kSql = "INSERT INTO metrics(id, canonical_unit, valid_min, valid_max, expected_period_us,"
+                                  " jitter_us, max_gap_us, interpolation, config_version, created_at_us)"
+                                  " VALUES(?, ?, NULL, NULL, NULL, NULL, NULL, 'none', ?, ?)"
+                                  " ON CONFLICT(id) DO UPDATE SET canonical_unit=excluded.canonical_unit,"
+                                  " config_version=excluded.config_version";
+        auto st = txn.value().prepare(kSql);
+        if (!st.ok())
+            return Result<void>::Err(st.error());
+        st.value().bind_text(1, dm.id);
+        st.value().bind_text(2, dm.unit);
+        st.value().bind_int64(3, version);
+        st.value().bind_int64(4, now);
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Done) {
+            return Result<void>::Err(Error::make(ErrorCode::DbStep, "upsert derived metric failed"));
+        }
+    }
+
     // device_metric pairs: rebuild from configuration.
     {
         auto del = txn.value().exec("DELETE FROM device_metrics");
@@ -190,6 +211,8 @@ Result<void> Store::sync_catalog(const ConfigSnapshot& cs) {
             if (dev.metrics.empty()) {
                 for (const auto& m : cs.cfg.metrics)
                     metric_ids.push_back(m.id);
+                for (const auto& dm : cs.cfg.derived_metrics)
+                    metric_ids.push_back(dm.id);
             } else {
                 metric_ids = dev.metrics;
             }
@@ -1077,6 +1100,24 @@ Result<bool> Store::ack_incident(const std::string& incident_uuid, const std::st
             return Result<bool>::Err(Error::make(ErrorCode::DbStep, "insert incident history failed"));
         }
     }
+    // Incident acknowledgement is an audited operation (FR-OBS-003); the audit row joins
+    // the ack transaction so both or neither persist.
+    {
+        auto st = txn.value().prepare("INSERT INTO audit_log(at_us, op, actor, target, result, request_id, details_json)"
+                                      " VALUES(?, 'incident_ack', ?, ?, 'ok', '', ?)");
+        if (!st.ok())
+            return Result<bool>::Err(st.error());
+        st.value().bind_int64(1, at_us);
+        st.value().bind_text(2, by);
+        st.value().bind_text(3, incident_uuid);
+        json details;
+        details["comment"] = comment;
+        st.value().bind_text(4, details.dump());
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Done) {
+            return Result<bool>::Err(Error::make(ErrorCode::DbStep, "insert ack audit failed"));
+        }
+    }
     auto commit = txn.value().commit();
     if (!commit.ok())
         return Result<bool>::Err(commit.error());
@@ -1146,6 +1187,543 @@ Result<int> Store::schema_version() {
     if (!rc.ok())
         return Result<int>::Err(rc.error());
     return Result<int>::Ok(rc.value());
+}
+
+Result<std::vector<IncidentRow>> Store::query_incidents_filtered(const IncidentFilter& filter) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string sql = "SELECT incident_uuid, rule_id, rule_version, device_id, severity, state, started_us, ended_us,"
+                      " hit_count, reopen_count, COALESCE(acked_by,''), COALESCE(ack_comment,'') FROM incidents WHERE 1";
+    std::vector<std::pair<int, std::string>> texts;
+    std::vector<std::pair<int, int64_t>> ints;
+    int idx = 1;
+    if (!filter.state.empty()) {
+        sql += " AND state=?";
+        texts.emplace_back(idx++, filter.state);
+    }
+    if (!filter.severity.empty()) {
+        sql += " AND severity=?";
+        texts.emplace_back(idx++, filter.severity);
+    }
+    if (!filter.device_id.empty()) {
+        sql += " AND device_id=?";
+        texts.emplace_back(idx++, filter.device_id);
+    }
+    if (!filter.rule_id.empty()) {
+        sql += " AND rule_id=?";
+        texts.emplace_back(idx++, filter.rule_id);
+    }
+    if (filter.from_us > 0) {
+        sql += " AND started_us>=?";
+        ints.emplace_back(idx++, filter.from_us);
+    }
+    if (filter.to_us > 0) {
+        sql += " AND started_us<=?";
+        ints.emplace_back(idx++, filter.to_us);
+    }
+    sql += " ORDER BY started_us DESC LIMIT ?";
+    ints.emplace_back(idx++, filter.limit);
+
+    auto st = db_.prepare(sql);
+    if (!st.ok())
+        return Result<std::vector<IncidentRow>>::Err(st.error());
+    for (const auto& [i, v] : texts)
+        st.value().bind_text(i, v);
+    for (const auto& [i, v] : ints)
+        st.value().bind_int64(i, v);
+    std::vector<IncidentRow> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<IncidentRow>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        IncidentRow r;
+        r.uuid = st.value().column_text(0);
+        r.rule_id = st.value().column_text(1);
+        r.rule_version = st.value().column_int64(2);
+        r.device_id = st.value().column_text(3);
+        r.severity = st.value().column_text(4);
+        r.state = st.value().column_text(5);
+        r.started_us = st.value().column_int64(6);
+        if (!st.value().column_is_null(7))
+            r.ended_us = st.value().column_int64(7);
+        r.hit_count = st.value().column_int64(8);
+        r.reopen_count = st.value().column_int64(9);
+        r.acked_by = st.value().column_text(10);
+        r.ack_comment = st.value().column_text(11);
+        rows.push_back(std::move(r));
+    }
+    return Result<std::vector<IncidentRow>>::Ok(std::move(rows));
+}
+
+Result<std::vector<TimelineEntry>> Store::incident_timeline(const std::string& incident_uuid) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT at_us, COALESCE(from_state,''), COALESCE(to_state,''), COALESCE(reason,''),"
+                          " COALESCE(actor,''), COALESCE(details_json,'') FROM incident_history"
+                          " WHERE incident_uuid=? ORDER BY at_us, id");
+    if (!st.ok())
+        return Result<std::vector<TimelineEntry>>::Err(st.error());
+    st.value().bind_text(1, incident_uuid);
+    std::vector<TimelineEntry> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<TimelineEntry>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        TimelineEntry e;
+        e.at_us = st.value().column_int64(0);
+        e.from_state = st.value().column_text(1);
+        e.to_state = st.value().column_text(2);
+        e.reason = st.value().column_text(3);
+        e.actor = st.value().column_text(4);
+        e.details_json = st.value().column_text(5);
+        rows.push_back(std::move(e));
+    }
+    return Result<std::vector<TimelineEntry>>::Ok(std::move(rows));
+}
+
+Result<int64_t> Store::count_incidents(const std::string& state) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT COUNT(*) FROM incidents WHERE state=?");
+    if (!st.ok())
+        return Result<int64_t>::Err(st.error());
+    st.value().bind_text(1, state);
+    auto step = st.value().step();
+    if (!step.ok() || step.value() != Stmt::Step::Row)
+        return Result<int64_t>::Err(Error::make(ErrorCode::DbStep, "count incidents failed"));
+    return Result<int64_t>::Ok(st.value().column_int64(0));
+}
+
+Result<std::optional<IncidentRow>> Store::get_incident(const std::string& incident_uuid) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT incident_uuid, rule_id, rule_version, device_id, severity, state, started_us,"
+                          " ended_us, hit_count, reopen_count, COALESCE(acked_by,''), COALESCE(ack_comment,'')"
+                          " FROM incidents WHERE incident_uuid=?");
+    if (!st.ok())
+        return Result<std::optional<IncidentRow>>::Err(st.error());
+    st.value().bind_text(1, incident_uuid);
+    auto step = st.value().step();
+    if (!step.ok())
+        return Result<std::optional<IncidentRow>>::Err(step.error());
+    if (step.value() != Stmt::Step::Row)
+        return Result<std::optional<IncidentRow>>::Ok(std::nullopt);
+    IncidentRow r;
+    r.uuid = st.value().column_text(0);
+    r.rule_id = st.value().column_text(1);
+    r.rule_version = st.value().column_int64(2);
+    r.device_id = st.value().column_text(3);
+    r.severity = st.value().column_text(4);
+    r.state = st.value().column_text(5);
+    r.started_us = st.value().column_int64(6);
+    if (!st.value().column_is_null(7))
+        r.ended_us = st.value().column_int64(7);
+    r.hit_count = st.value().column_int64(8);
+    r.reopen_count = st.value().column_int64(9);
+    r.acked_by = st.value().column_text(10);
+    r.ack_comment = st.value().column_text(11);
+    return Result<std::optional<IncidentRow>>::Ok(std::move(r));
+}
+
+Result<SamplePage> Store::query_samples_page(const std::string& device_id, const std::string& metric_id,
+                                             int64_t from_us, int64_t to_us, int64_t after_id, int64_t limit) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT id, sample_uuid, device_id, metric_id, event_time_us, ingest_time_us, value,"
+                          " input_unit, quality, sequence, flags, config_version, tags_json FROM samples"
+                          " WHERE device_id=? AND metric_id=? AND event_time_us>=? AND event_time_us<? AND id>?"
+                          " ORDER BY event_time_us, id LIMIT ?");
+    // One extra row is fetched (LIMIT limit+1) so has_more can be detected.
+    if (!st.ok())
+        return Result<SamplePage>::Err(st.error());
+    auto b1 = st.value().bind_text(1, device_id);
+    auto b2 = st.value().bind_text(2, metric_id);
+    auto b3 = st.value().bind_int64(3, from_us);
+    auto b4 = st.value().bind_int64(4, to_us);
+    auto b5 = st.value().bind_int64(5, after_id);
+    auto b6 = st.value().bind_int64(6, limit + 1);
+    if (!b1.ok() || !b2.ok() || !b3.ok() || !b4.ok() || !b5.ok() || !b6.ok()) {
+        return Result<SamplePage>::Err(Error::make(ErrorCode::DbStep, "sample page bind failed"));
+    }
+    SamplePage page;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<SamplePage>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        if (static_cast<int64_t>(page.rows.size()) >= limit) {
+            page.has_more = true; // overflow row exists: another page follows
+            break;
+        }
+        SampleRow r;
+        page.last_id = st.value().column_int64(0);
+        r.sample_uuid = st.value().column_text(1);
+        r.device_id = st.value().column_text(2);
+        r.metric_id = st.value().column_text(3);
+        r.event_time_us = st.value().column_int64(4);
+        r.ingest_time_us = st.value().column_int64(5);
+        if (!st.value().column_is_null(6))
+            r.value = st.value().column_double(6);
+        r.value_is_null = st.value().column_is_null(6);
+        r.input_unit = st.value().column_text(7);
+        r.quality = st.value().column_int64(8);
+        if (!st.value().column_is_null(9)) {
+            r.has_sequence = true;
+            r.sequence = static_cast<uint64_t>(st.value().column_int64(9));
+        }
+        r.flags = static_cast<uint32_t>(st.value().column_int64(10));
+        r.config_version = st.value().column_int64(11);
+        r.tags_json = st.value().column_text(12);
+        page.rows.push_back(std::move(r));
+    }
+    return Result<SamplePage>::Ok(std::move(page));
+}
+
+Result<std::vector<DeviceRow>> Store::list_devices() {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT id, timezone, tags_json, enabled, config_version FROM devices ORDER BY id");
+    if (!st.ok())
+        return Result<std::vector<DeviceRow>>::Err(st.error());
+    std::vector<DeviceRow> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<DeviceRow>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        DeviceRow d;
+        d.id = st.value().column_text(0);
+        d.timezone = st.value().column_text(1);
+        d.enabled = st.value().column_int64(3) != 0;
+        d.config_version = st.value().column_int64(4);
+        auto parsed = json::parse(st.value().column_text(2), nullptr, false);
+        if (parsed.is_object())
+            for (auto it = parsed.begin(); it != parsed.end(); ++it)
+                d.tags.emplace_back(it.key(), it.value().is_string() ? it.value().get<std::string>()
+                                                                     : it.value().dump());
+        rows.push_back(std::move(d));
+    }
+    return Result<std::vector<DeviceRow>>::Ok(std::move(rows));
+}
+
+Result<std::vector<AggregateRow>> Store::query_aggregates(const std::string& device_id, const std::string& metric_id,
+                                                          const std::string& window_type, int64_t from_us,
+                                                          int64_t to_us, int64_t limit) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string sql = "SELECT device_id, metric_id, window_type, start_us, end_us, version, sample_count, valid_count,"
+                      " missing_count, bad_quality_count, synthetic_count, min_value, max_value, avg_value, sum_value,"
+                      " stddev, first_value, first_time_us, last_value, last_time_us, p50, p95, p99, superseded,"
+                      " created_at_us FROM aggregates WHERE superseded=0";
+    std::vector<std::pair<int, std::string>> texts;
+    std::vector<std::pair<int, int64_t>> ints;
+    int idx = 1;
+    if (!device_id.empty()) {
+        sql += " AND device_id=?";
+        texts.emplace_back(idx++, device_id);
+    }
+    if (!metric_id.empty()) {
+        sql += " AND metric_id=?";
+        texts.emplace_back(idx++, metric_id);
+    }
+    if (!window_type.empty()) {
+        sql += " AND window_type=?";
+        texts.emplace_back(idx++, window_type);
+    }
+    if (from_us > 0) {
+        sql += " AND end_us>?";
+        ints.emplace_back(idx++, from_us);
+    }
+    if (to_us > 0) {
+        sql += " AND start_us<?";
+        ints.emplace_back(idx++, to_us);
+    }
+    sql += " ORDER BY start_us DESC LIMIT ?";
+    ints.emplace_back(idx++, limit);
+
+    auto st = db_.prepare(sql);
+    if (!st.ok())
+        return Result<std::vector<AggregateRow>>::Err(st.error());
+    for (const auto& [i, v] : texts)
+        st.value().bind_text(i, v);
+    for (const auto& [i, v] : ints)
+        st.value().bind_int64(i, v);
+    std::vector<AggregateRow> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<AggregateRow>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        AggregateRow r;
+        r.device_id = st.value().column_text(0);
+        r.metric_id = st.value().column_text(1);
+        r.window_type = st.value().column_text(2);
+        r.start_us = st.value().column_int64(3);
+        r.end_us = st.value().column_int64(4);
+        r.version = st.value().column_int64(5);
+        r.sample_count = st.value().column_int64(6);
+        r.valid_count = st.value().column_int64(7);
+        r.missing_count = st.value().column_int64(8);
+        r.bad_quality_count = st.value().column_int64(9);
+        r.synthetic_count = st.value().column_int64(10);
+        auto opt_double = [&](int col) -> std::optional<double> {
+            return st.value().column_is_null(col) ? std::nullopt : std::optional<double>(st.value().column_double(col));
+        };
+        auto opt_int = [&](int col) -> std::optional<int64_t> {
+            return st.value().column_is_null(col) ? std::nullopt : std::optional<int64_t>(st.value().column_int64(col));
+        };
+        r.min_value = opt_double(11);
+        r.max_value = opt_double(12);
+        r.avg_value = opt_double(13);
+        r.sum_value = opt_double(14);
+        r.stddev = opt_double(15);
+        r.first_value = opt_double(16);
+        r.first_time_us = opt_int(17);
+        r.last_value = opt_double(18);
+        r.last_time_us = opt_int(19);
+        r.p50 = opt_double(20);
+        r.p95 = opt_double(21);
+        r.p99 = opt_double(22);
+        r.superseded = st.value().column_int64(23) != 0;
+        r.created_at_us = st.value().column_int64(24);
+        rows.push_back(std::move(r));
+    }
+    return Result<std::vector<AggregateRow>>::Ok(std::move(rows));
+}
+
+// Batched retention deletes (FR-DB-004): per target, repeatedly select up to batch_rows
+// ids and delete them inside one transaction until the range is exhausted.
+Result<int64_t> Store::purge_retention(const RetentionConfig& retention, int64_t batch_rows) {
+    const int64_t day_us = 24LL * 3600 * 1000000;
+    const int64_t now = now_unix_us();
+    struct Target {
+        const char* select_sql;
+        const char* table;
+        int64_t cutoff;
+    };
+    const std::vector<Target> targets = {
+        {"SELECT id FROM samples WHERE event_time_us < ? ORDER BY id LIMIT ?", "samples",
+         now - retention.samples_days * day_us},
+        {"SELECT id FROM aggregates WHERE end_us < ? ORDER BY id LIMIT ?", "aggregates",
+         now - retention.aggregates_days * day_us},
+        // Closed incidents only: open incidents are never purged (FR-DB-004); the
+        // incident_history rows cascade with their incident (foreign_keys=ON).
+        {"SELECT id FROM incidents WHERE state='closed' AND ended_us IS NOT NULL AND ended_us < ?"
+         " ORDER BY id LIMIT ?",
+         "incidents", now - retention.incidents_days * day_us},
+        {"SELECT id FROM audit_log WHERE at_us < ? ORDER BY id LIMIT ?", "audit_log",
+         now - retention.audit_days * day_us},
+    };
+
+    int64_t total = 0;
+    for (const auto& target : targets) {
+        for (;;) {
+            std::vector<int64_t> ids;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto txn = Txn::begin(db_);
+                if (!txn.ok())
+                    return Result<int64_t>::Err(txn.error());
+                auto sel = txn.value().prepare(target.select_sql);
+                if (!sel.ok())
+                    return Result<int64_t>::Err(sel.error());
+                auto b1 = sel.value().bind_int64(1, target.cutoff);
+                if (!b1.ok())
+                    return Result<int64_t>::Err(b1.error());
+                auto b2 = sel.value().bind_int64(2, batch_rows);
+                if (!b2.ok())
+                    return Result<int64_t>::Err(b2.error());
+                for (;;) {
+                    auto step = sel.value().step();
+                    if (!step.ok())
+                        return Result<int64_t>::Err(step.error());
+                    if (step.value() != Stmt::Step::Row)
+                        break;
+                    ids.push_back(sel.value().column_int64(0));
+                }
+                if (!ids.empty()) {
+                    std::string del_sql = std::string("DELETE FROM ") + target.table + " WHERE id IN (";
+                    for (size_t i = 0; i < ids.size(); ++i)
+                        del_sql += i == 0 ? "?" : ", ?";
+                    del_sql += ")";
+                    auto del = txn.value().prepare(del_sql);
+                    if (!del.ok())
+                        return Result<int64_t>::Err(del.error());
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        auto bound = del.value().bind_int64(static_cast<int>(i + 1), ids[i]);
+                        if (!bound.ok())
+                            return Result<int64_t>::Err(bound.error());
+                    }
+                    auto step = del.value().step();
+                    if (!step.ok() || step.value() != Stmt::Step::Done)
+                        return Result<int64_t>::Err(Error::make(ErrorCode::DbStep, "retention delete failed"));
+                    auto commit = txn.value().commit();
+                    if (!commit.ok())
+                        return Result<int64_t>::Err(commit.error());
+                }
+            }
+            if (ids.empty())
+                break;
+            total += static_cast<int64_t>(ids.size());
+            if (ids.size() < static_cast<size_t>(batch_rows))
+                break;
+        }
+    }
+    return Result<int64_t>::Ok(total);
+}
+
+Result<std::vector<DeviceMetricStats>> Store::summary_by_device_metric(const std::string& device_id,
+                                                                       const std::string& metric_id, int64_t from_us,
+                                                                       int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string sql = "SELECT device_id, metric_id, COUNT(*), SUM(value IS NULL),"
+                      " SUM(quality != 2), MIN(value), MAX(value), AVG(value) FROM samples"
+                      " WHERE event_time_us>=? AND event_time_us<?";
+    std::vector<std::pair<int, std::string>> texts;
+    int idx = 1;
+    if (!device_id.empty()) {
+        sql += " AND device_id=?";
+        texts.emplace_back(idx++, device_id);
+    }
+    if (!metric_id.empty()) {
+        sql += " AND metric_id=?";
+        texts.emplace_back(idx++, metric_id);
+    }
+    sql += " GROUP BY device_id, metric_id ORDER BY device_id, metric_id";
+    auto st = db_.prepare(sql);
+    if (!st.ok())
+        return Result<std::vector<DeviceMetricStats>>::Err(st.error());
+    auto b1 = st.value().bind_int64(idx++, from_us);
+    auto b2 = st.value().bind_int64(idx++, to_us);
+    if (!b1.ok() || !b2.ok())
+        return Result<std::vector<DeviceMetricStats>>::Err(Error::make(ErrorCode::DbStep, "summary bind failed"));
+    for (const auto& [i, v] : texts) {
+        auto bound = st.value().bind_text(i, v);
+        if (!bound.ok())
+            return Result<std::vector<DeviceMetricStats>>::Err(bound.error());
+    }
+    std::vector<DeviceMetricStats> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<DeviceMetricStats>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        DeviceMetricStats s;
+        s.device_id = st.value().column_text(0);
+        s.metric_id = st.value().column_text(1);
+        s.sample_count = st.value().column_int64(2);
+        s.null_count = st.value().column_int64(3);
+        s.bad_quality_count = st.value().column_int64(4);
+        if (!st.value().column_is_null(5))
+            s.min_value = st.value().column_double(5);
+        if (!st.value().column_is_null(6))
+            s.max_value = st.value().column_double(6);
+        if (!st.value().column_is_null(7))
+            s.avg_value = st.value().column_double(7);
+        rows.push_back(std::move(s));
+    }
+    return Result<std::vector<DeviceMetricStats>>::Ok(std::move(rows));
+}
+
+Result<std::vector<MissingSummary>> Store::missing_summary(const std::string& device_id, const std::string& metric_id,
+                                                           int64_t from_us, int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT device_id, metric_id, COUNT(*), SUM(expected_count) FROM missing_intervals"
+                          " WHERE start_us<? AND end_us>? AND device_id LIKE ? AND metric_id LIKE ?"
+                          " GROUP BY device_id, metric_id ORDER BY device_id, metric_id");
+    if (!st.ok())
+        return Result<std::vector<MissingSummary>>::Err(st.error());
+    auto b1 = st.value().bind_int64(1, to_us);
+    auto b2 = st.value().bind_int64(2, from_us);
+    auto b3 = st.value().bind_text(3, device_id.empty() ? "%" : device_id);
+    auto b4 = st.value().bind_text(4, metric_id.empty() ? "%" : metric_id);
+    if (!b1.ok() || !b2.ok() || !b3.ok() || !b4.ok())
+        return Result<std::vector<MissingSummary>>::Err(Error::make(ErrorCode::DbStep, "missing summary bind failed"));
+    std::vector<MissingSummary> rows;
+    for (;;) {
+        auto step = st.value().step();
+        if (!step.ok())
+            return Result<std::vector<MissingSummary>>::Err(step.error());
+        if (step.value() != Stmt::Step::Row)
+            break;
+        MissingSummary g;
+        g.device_id = st.value().column_text(0);
+        g.metric_id = st.value().column_text(1);
+        g.intervals = st.value().column_int64(2);
+        g.expected_count = st.value().column_is_null(3) ? 0 : st.value().column_int64(3);
+        rows.push_back(std::move(g));
+    }
+    return Result<std::vector<MissingSummary>>::Ok(std::move(rows));
+}
+
+Result<QualityStats> Store::quality_summary(int64_t from_us, int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    QualityStats out;
+    {
+        auto st = db_.prepare("SELECT COALESCE(SUM(record_count),0), COALESCE(SUM(accepted_count),0),"
+                              " COALESCE(SUM(format_errors),0), COALESCE(SUM(business_errors),0) FROM source_files"
+                              " WHERE first_seen_at_us>=? AND first_seen_at_us<?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, from_us);
+        auto b2 = st.value().bind_int64(2, to_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality files bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality files query failed"));
+        out.records = st.value().column_int64(0);
+        out.accepted = st.value().column_int64(1);
+        out.format_errors = st.value().column_int64(2);
+        out.business_errors = st.value().column_int64(3);
+    }
+    out.duplicates = std::max<int64_t>(0, out.records - out.accepted - out.format_errors - out.business_errors);
+    {
+        auto st = db_.prepare("SELECT"
+                              " SUM((flags & 2) != 0), SUM((flags & 4) != 0), SUM((flags & 32) != 0)"
+                              " FROM samples WHERE event_time_us>=? AND event_time_us<?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, from_us);
+        auto b2 = st.value().bind_int64(2, to_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality flags bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality flags query failed"));
+        out.late_samples = st.value().column_is_null(0) ? 0 : st.value().column_int64(0);
+        out.interpolated_samples = st.value().column_is_null(1) ? 0 : st.value().column_int64(1);
+        out.derived_samples = st.value().column_is_null(2) ? 0 : st.value().column_int64(2);
+    }
+    {
+        auto st = db_.prepare("SELECT COUNT(*) FROM missing_intervals WHERE start_us<? AND end_us>?");
+        if (!st.ok())
+            return Result<QualityStats>::Err(st.error());
+        auto b1 = st.value().bind_int64(1, to_us);
+        auto b2 = st.value().bind_int64(2, from_us);
+        if (!b1.ok() || !b2.ok())
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality missing bind failed"));
+        auto step = st.value().step();
+        if (!step.ok() || step.value() != Stmt::Step::Row)
+            return Result<QualityStats>::Err(Error::make(ErrorCode::DbStep, "quality missing query failed"));
+        out.missing_intervals = st.value().column_int64(0);
+    }
+    return Result<QualityStats>::Ok(out);
+}
+
+Result<int64_t> Store::data_cutoff_us(int64_t to_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto st = db_.prepare("SELECT COALESCE(MAX(event_time_us), 0) FROM samples WHERE event_time_us<=?");
+    if (!st.ok())
+        return Result<int64_t>::Err(st.error());
+    auto bound = st.value().bind_int64(1, to_us);
+    if (!bound.ok())
+        return Result<int64_t>::Err(bound.error());
+    auto step = st.value().step();
+    if (!step.ok() || step.value() != Stmt::Step::Row)
+        return Result<int64_t>::Err(Error::make(ErrorCode::DbStep, "data cutoff query failed"));
+    return Result<int64_t>::Ok(st.value().column_int64(0));
 }
 
 } // namespace storage

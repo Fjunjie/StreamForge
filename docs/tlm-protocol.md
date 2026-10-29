@@ -1,4 +1,4 @@
-# TLM 二进制协议说明（草案 v0.1，供 M2 前审查）
+# TLM 二进制协议说明（v1.0，M2 已实现；实现见 c/tlmcodec/）
 
 状态：**草案**。本文档定义 StreamForge 自定义 TLM 二进制遥测格式的完整编解码规则。
 M2 交付的 `libtlmcodec`（C11）与 data_generator 以本文为准；字段编码、长度边界与

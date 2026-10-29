@@ -358,9 +358,19 @@ Result<std::shared_ptr<const ConfigSnapshot>> parse_and_validate(const YAML::Nod
 
     // server ------------------------------------------------------------------
     if (const YAML::Node s = root["server"]) {
-        check_keys(s, {"bind", "port"}, "server", warnings);
+        check_keys(s, {"bind", "port", "admin_token_file", "max_query_range"}, "server", warnings);
         c.server.bind = optional_string(s, "bind", c.server.bind);
         c.server.port = static_cast<int>(optional_int(s, "port", c.server.port, "server", errors));
+        c.server.admin_token_file = optional_string(s, "admin_token_file", c.server.admin_token_file);
+        if (const YAML::Node n = s["max_query_range"]) {
+            auto parsed = parse_duration_us(n.as<std::string>());
+            if (parsed.ok())
+                c.server.max_query_range_us = parsed.value();
+            else
+                errors.push_back(
+                    Error::make(ErrorCode::ConfigValidation, "server.max_query_range must be a duration like 24h")
+                        .ctx("location", "server"));
+        }
     }
     if (c.server.bind.empty()) {
         errors.push_back(

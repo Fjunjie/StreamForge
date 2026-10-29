@@ -74,6 +74,17 @@ Result<RuleType> parse_rule_type(const std::string& type) {
     return Result<RuleType>::Err(Error::make(ErrorCode::ConfigValidation, "unknown rule type '" + type + "'"));
 }
 
+// Walks an AST collecting duration literals used as window-function arguments.
+void collect_window_durations(const expr::ExprNode& node, int64_t& best) {
+    if (node.kind == expr::ExprNode::Kind::FunctionCall &&
+        (node.identifier == "avg" || node.identifier == "delta" || node.identifier == "rate") &&
+        node.args.size() == 2 && node.args[1]->kind == expr::ExprNode::Kind::DurationLit) {
+        best = std::max(best, node.args[1]->duration_us);
+    }
+    for (const auto& arg : node.args)
+        collect_window_durations(*arg, best);
+}
+
 // True when the metric id exists as a base metric or a derived metric.
 bool metric_exists(const ConfigSnapshot& cs, const std::string& id) {
     if (cs.metric(id) != nullptr)
@@ -101,6 +112,17 @@ private:
 };
 
 } // namespace
+
+int64_t max_rule_window_us(const std::vector<CompiledRule>& rules) {
+    int64_t best = 0;
+    for (const auto& rule : rules) {
+        if (rule.trigger_ast)
+            collect_window_durations(*rule.trigger_ast, best);
+        if (rule.recovery_ast)
+            collect_window_durations(*rule.recovery_ast, best);
+    }
+    return best;
+}
 
 RuleEngine::RuleEngine(storage::Store& store) : store_(&store) {}
 
@@ -246,11 +268,22 @@ Result<void> RuleEngine::load_rules(const ConfigSnapshot& cs) {
     return Result<void>::Ok();
 }
 
+void RuleEngine::set_window_provider(
+    std::function<std::optional<double>(const std::string& device, const std::string& metric, int64_t duration_us,
+                                        const std::string& func)>
+        provider) {
+    std::lock_guard<std::mutex> lk(mu_);
+    window_provider_ = std::move(provider);
+}
+
 Result<void> RuleEngine::evaluate_device(const std::string& device_id, int64_t eval_time_us,
                                          const std::map<std::string, double>& metric_values,
                                          const std::map<std::string, std::string>& /*metric_units*/) {
     // metric_units is reserved for unit-aware rule checks (future work).
     std::lock_guard<std::mutex> lk(mu_);
+
+    // Snapshot the window provider under the lock: it reads the ingest-fed buffer.
+    auto provider = window_provider_;
 
     for (const auto& rule : rules_) {
         if (!device_matches(rule, device_id))
@@ -265,9 +298,11 @@ Result<void> RuleEngine::evaluate_device(const std::string& device_id, int64_t e
                 return std::nullopt;
             return it->second;
         };
-        // ctx.lookup_window stays unset: window functions in rule expressions surface
-        // as an evaluation error and skip the rule (logged below) instead of failing
-        // the pipeline.
+        if (provider)
+            ctx.lookup_window = [&provider, &device_id](const std::string& m, int64_t dur_us,
+                                                        const std::string& fn) -> std::optional<double> {
+                return provider(device_id, m, dur_us, fn);
+            };
 
         auto evaluated = evaluate_rule(rule, ctx);
         if (!evaluated.ok()) {

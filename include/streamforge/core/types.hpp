@@ -11,6 +11,7 @@ constexpr uint32_t kLate = 1u << 1;        // arrived after the watermark
 constexpr uint32_t kSynthetic = 1u << 2;   // produced by interpolation
 constexpr uint32_t kForcedFlush = 1u << 3; // emitted because the reorder buffer hit its limit
 constexpr uint32_t kSuspicious = 1u << 4;  // TLM resync recovery, quality downgraded
+constexpr uint32_t kDerived = 1u << 5;     // produced by a derived-metric expression (FR-DER-002)
 } // namespace sample_flags
 
 // Record quality codes (requirement FR-FMT-001).
